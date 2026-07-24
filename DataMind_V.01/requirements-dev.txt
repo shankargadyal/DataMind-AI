@@ -1,5 +1,0 @@
-# Extra dependencies needed only for running the test suite / CI —
-# not needed to run the app itself (see requirements.txt for that).
--r requirements.txt
-pytest>=8.0.0
-pytest-cov>=5.0.0
