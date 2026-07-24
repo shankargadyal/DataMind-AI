@@ -1,0 +1,28 @@
+# Render deployment blueprint.
+# Push this repo to GitHub, then in Render: New + > Blueprint > select this repo.
+# Render will read this file and provision the service automatically.
+
+services:
+  - type: web
+    name: datamind-v01
+    runtime: python
+    plan: free
+    region: oregon
+    branch: main
+    buildCommand: "pip install --upgrade pip && pip install -r requirements.txt"
+    startCommand: "gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 120 app:app"
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false          # set manually in the Render dashboard — never commit this
+      - key: SECRET_KEY
+        generateValue: true  # Render generates a random secret for Flask sessions
+      - key: FLASK_ENV
+        value: production
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      # DATABASE_URL intentionally left unset here — defaults to a local SQLite
+      # file, which Render's free tier wipes on every redeploy. Add a Render
+      # Postgres instance and set DATABASE_URL if user accounts/history need
+      # to survive restarts (see ARCHITECTURE.md §4).
+    healthCheckPath: /
+    autoDeploy: true
