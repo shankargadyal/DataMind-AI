@@ -6,8 +6,10 @@ import {
 
 // ─── CONFIG ──────────────────────────────────────────────────────
 // Use the same machine hostname as the frontend, but talk to Flask on port 5000.
-const API_BASE = `${window.location.protocol}//${window.location.hostname}:5000`;
-
+const API_BASE =
+  window.location.hostname === "localhost"
+    ? "http://localhost:5000"
+    : window.location.origin;
 const CHART_COLORS = ["#D98E2B","#2BA8AF","#4FB88A","#E0566F","#9B6FD9","#4FA8C9","#D9772E","#7AA85C"];
 
 // ─── CSS VARIABLES & GLOBAL STYLES ───────────────────────────────
