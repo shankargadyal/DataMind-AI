@@ -31,4 +31,4 @@ ENV PYTHONUNBUFFERED=1 \
 EXPOSE 5000
 
 # gunicorn is already in requirements.txt — use it instead of the Flask dev server
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "2", "--timeout", "120", "app:app"]
+CMD ["gunicorn", "--bind", "0.0.0.0:5000", "--workers", "1", "--timeout", "120", "app:app"]
