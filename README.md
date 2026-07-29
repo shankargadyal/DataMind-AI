@@ -179,28 +179,6 @@ The "Agent Pipeline" panel in the UI isn't just a progress bar — `/api/status/
 
 ---
 
-## Deployment
-
-### Docker (any host)
-```bash
-docker build -t datamind .
-docker run -p 5000:5000 -e GROQ_API_KEY=gsk_xxx -e SECRET_KEY=$(python -c "import secrets;print(secrets.token_hex(32))") datamind
-```
-Or with Compose: `GROQ_API_KEY=gsk_xxx docker compose up --build`
-
-### Render
-1. Push this repo to GitHub.
-2. Render → **New** → **Blueprint** → select the repo. `render.yaml` configures the service automatically.
-3. Set `GROQ_API_KEY` in the Render dashboard (marked `sync: false` in the blueprint so it's never committed).
-
-### Railway
-1. Push to GitHub, then **New Project → Deploy from GitHub repo** in Railway.
-2. Railway reads `railway.json` automatically. Set `GROQ_API_KEY` and `SECRET_KEY` as variables in the Railway dashboard.
-
-### Notes for any host
-- Set `FLASK_ENV=production` so debug mode is off.
-- The app uses `gunicorn` as the WSGI server in all deployment paths above — don't use `python app.py` (the Flask dev server) in production.
-- User accounts, experiment history, and LLM call logs live in a real database (SQLAlchemy, SQLite by default) — set `DATABASE_URL` to a Postgres connection string for real multi-instance hosting. On Render/Railway's free tiers, an unset `DATABASE_URL` means SQLite writes to local disk, which gets wiped on every redeploy; fine for a demo, but add a managed Postgres add-on if you need accounts/history to persist.
 
 ---
 
@@ -221,3 +199,30 @@ The same palette and type system carry through to the standalone HTML dashboard 
 
 ## Python Version
 Tested with Python 3.11–3.12.
+
+---
+# 👨‍💻 About Me
+
+ Hi, I'm Shankar Gadyal, an aspiring AI Engineer and MSc Data Science student passionate about Machine Learning, Artificial Intelligence, Generative AI, and Full-Stack         AI Applications.
+
+I'm actively building production-ready AI systems and continuously exploring modern LLMs, Multi-Agent AI, RAG, and Explainable AI.
+
+📬 Connect With Me
+
+💼 LinkedIn: https://www.linkedin.com/in/shankargadyal
+
+💻 GitHub: https://github.com/shankargadyal
+
+📧 Email: gadyalshankar@gmail.com
+
+🌐 Portfolio: https://your-portfolio-url.com
+
+⭐ Support If you found this project helpful, please consider giving it a ⭐ on GitHub.
+    It motivates me to keep building and sharing more AI projects.
+
+📄 License
+This project is licensed under the MIT License.
+
+----
+
+Made with ❤️ by Shankar Gadyal
