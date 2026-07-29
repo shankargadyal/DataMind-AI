@@ -1,4 +1,4 @@
-# DataMind -AI🤖
+# DataMind - AI🤖
 
 
 **An autonomous multi-agent analytics copilot.** Upload any CSV, and a pipeline of specialized AI agents profiles it, cleans it, trains and compares ML models, explains *why* the model predicts what it predicts, scores data quality, checks its own outputs for consistency, and writes an executive report — no code required.
