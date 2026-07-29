@@ -1,7 +1,5 @@
 # DataMind 🤖
 
-[![Tests](https://github.com/shankargadyal/DataMind-AI/actions/workflows/tests.yml/badge.svg)](https://github.com/shankargadyal/DataMind-AI/actions/workflows/tests.yml)
-
 
 **An autonomous multi-agent analytics copilot.** Upload any CSV, and a pipeline of specialized AI agents profiles it, cleans it, trains and compares ML models, explains *why* the model predicts what it predicts, scores data quality, checks its own outputs for consistency, and writes an executive report — no code required.
 
@@ -12,6 +10,13 @@ Built with Flask + Groq LLaMA 3.3 70B + scikit-learn/XGBoost/LightGBM/CatBoost +
 ## 🌐 Live Demo
 
 **Portfolio:** https://datamind-ai-887682911552.asia-south1.run.app/
+
+# 📸 Screenshots
+<img width="1907" height="875" alt="datamind-3" src="https://github.com/user-attachments/assets/7817257e-9b3a-4437-a7e2-59478f89400f" />
+
+<img width="1909" height="881" alt="datamind-1" src="https://github.com/user-attachments/assets/6bf0fd2f-6a3d-4a65-a78c-a3b429a3d975" />
+
+
 
 ---
 
