@@ -9,6 +9,10 @@ Built with Flask + Groq LLaMA 3.3 70B + scikit-learn/XGBoost/LightGBM/CatBoost +
 
 **Try it without uploading anything**: the upload page has a "Try it instantly" button that runs the full pipeline on a bundled synthetic HR attrition dataset.
 
+## 🌐 Live Demo
+
+**Portfolio:** https://datamind-ai-887682911552.asia-south1.run.app/
+
 ---
 
 ## What makes this more than a student ML project
