@@ -249,7 +249,7 @@ except ImportError:
                             f"<b>{a.get('action', a.get('title',''))}</b>"
                             f" — {a.get('reason', a.get('detail',''))}", body))
                     else:
-                        story.append(Paragraph(f"\u2022 {a}", body))
+                        story.append(Paragraph(f"• {a}", body))
 
             # ML results
             ml_rec = analysis.get("ml_recommendation", {})
@@ -400,6 +400,75 @@ def _safe_ctx(det: dict) -> dict:
 
 def _safe_ml(ml: dict) -> dict:
     return {k: _safe_val(v) for k, v in ml.items() if not k.startswith("_")}
+
+
+# ── NEW: Dataset summary builder for the chat copilot ──────────────
+# Pulls together stats that already exist elsewhere in the pipeline
+# (column_stats, correlation, categorical value_counts) into one dict
+# so /api/chat can answer numeric/structural questions without RAG.
+def build_dataset_summary(df: pd.DataFrame, ctx_safe: dict, ml_rec: dict) -> dict:
+    summary = {
+        "num_rows": int(len(df)),
+        "num_columns": int(len(df.columns)),
+        "column_names": list(df.columns),
+        "numeric_columns": ctx_safe.get("numeric_cols", []),
+        "categorical_columns": ctx_safe.get("categorical_cols", []),
+        "dtypes": {col: str(df[col].dtype) for col in df.columns},
+        "missing_values": {col: int(df[col].isna().sum()) for col in df.columns},
+        "duplicate_rows": int(df.duplicated().sum()),
+    }
+
+    # describe() gives min/max/mean/median/std for every numeric column in
+    # one pass — reused instead of recomputing per-column with pandas calls.
+    if summary["numeric_columns"]:
+        desc = df[summary["numeric_columns"]].describe().to_dict()
+        summary["numeric_stats"] = {
+            col: {
+                "min": round(float(v.get("min", 0)), 2),
+                "max": round(float(v.get("max", 0)), 2),
+                "mean": round(float(v.get("mean", 0)), 2),
+                "median": round(float(df[col].median()), 2) if col in df else None,
+                "std": round(float(v.get("std", 0)), 2),
+            }
+            for col, v in desc.items()
+        }
+    else:
+        summary["numeric_stats"] = {}
+
+    # Common named columns get a shortcut entry so the LLM doesn't have to
+    # search numeric_stats by exact column name (which varies per dataset).
+    def _find_col(*candidates):
+        for c in df.columns:
+            if c.lower() in candidates:
+                return c
+        return None
+
+    age_col = _find_col("age")
+    if age_col:
+        summary["age_stats"] = summary["numeric_stats"].get(age_col)
+
+    income_col = _find_col("salary", "monthlyincome", "income")
+    if income_col:
+        summary["income_stats"] = summary["numeric_stats"].get(income_col)
+
+    # Target class distribution, if this was a classification job
+    target_col = ml_rec.get("target_column")
+    if target_col and target_col in df.columns:
+        summary["target_distribution"] = df[target_col].value_counts().to_dict()
+
+    # Top correlated pairs, reusing whatever Detective already computed
+    corr = ctx_safe.get("correlation", {})
+    if corr:
+        summary["correlation_available"] = True
+        summary["correlation"] = corr
+    else:
+        summary["correlation_available"] = False
+
+    # First 10 rows, kept as records so /api/chat can return them verbatim
+    # without asking the LLM to reproduce tabular data from memory.
+    summary["preview_rows"] = df.head(10).to_dict(orient="records")
+
+    return summary
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -834,7 +903,7 @@ def whatif(job_id):
 @app.route("/api/chat", methods=["POST"])
 @_rate_limit("30/minute")
 def chat():
-    user, err = _require_auth()   # BUG-04
+    user, err = _require_auth()   # BUG-04 — unchanged
     if err: return err
 
     from groq import Groq
@@ -851,13 +920,25 @@ def chat():
             return jsonify({"error": "Job not found"}), 404
         if job.get("user") not in ("guest@datamind.ai", user["email"]):
             return jsonify({"error": "Forbidden"}), 403
-    ad  = (job.get("result") or {}).get("analysis_data", {})
-    ml_rec = ad.get("ml_recommendation", {})
 
-    # RAG: retrieve only the chunks relevant to this specific question,
-    # searched across the FULL analysis output (all insights, all actions,
-    # SHAP captions, quality report, industry KPIs) — not a fixed
-    # first-N slice like before.
+    result = job.get("result") or {}
+    ad = result.get("analysis_data", {})
+    ml_rec = ad.get("ml_recommendation", {})
+    dataset_summary = result.get("dataset_summary", {})   # NEW
+
+    # ── NEW: deterministic short-circuit for row-preview requests ──
+    # Avoids asking the LLM to reproduce tabular data, which it will
+    # paraphrase or drop rows on. Regex is intentionally narrow so it
+    # only fires on clear "show me rows" style phrasing.
+    row_request = re.search(r"\b(first|top)\s+(\d{1,3})\s+rows?\b", message.lower())
+    if row_request and dataset_summary.get("preview_rows"):
+        n = min(int(row_request.group(2)), len(dataset_summary["preview_rows"]))
+        rows = dataset_summary["preview_rows"][:n]
+        reply = f"Here are the first {n} rows:\n\n" + json.dumps(rows, indent=2, default=str)
+        return jsonify({"reply": reply, "chat_key": job_id or "preview"})
+
+    # RAG: unchanged — retrieval over the full analysis output (TF-IDF index,
+    # not embeddings — this app never used a vector DB, see rag_agent.py)
     rag_index = job.get("rag_index")
     retrieved_text = "None available."
     if rag_index is not None:
@@ -865,17 +946,55 @@ def chat():
         if hits:
             retrieved_text = "\n".join(f"- ({h['source']}) {h['text']}" for h in hits)
 
+    # ── NEW: compact dataset summary block for the prompt ──
+    # Capped and rounded so this doesn't blow up token usage on wide datasets.
+    if dataset_summary:
+        numeric_preview = dict(list(dataset_summary.get("numeric_stats", {}).items())[:15])
+        dataset_summary_text = (
+            f"Rows: {dataset_summary.get('num_rows')}  |  Columns: {dataset_summary.get('num_columns')}\n"
+            f"Column names: {', '.join(dataset_summary.get('column_names', [])[:40])}\n"
+            f"Numeric columns: {', '.join(dataset_summary.get('numeric_columns', []))}\n"
+            f"Categorical columns: {', '.join(dataset_summary.get('categorical_columns', []))}\n"
+            f"Duplicate rows: {dataset_summary.get('duplicate_rows')}\n"
+            f"Missing values per column: {dataset_summary.get('missing_values')}\n"
+            f"Numeric stats (min/max/mean/median/std): {numeric_preview}\n"
+        )
+        if dataset_summary.get("age_stats"):
+            dataset_summary_text += f"Age stats: {dataset_summary['age_stats']}\n"
+        if dataset_summary.get("income_stats"):
+            dataset_summary_text += f"Salary/Income stats: {dataset_summary['income_stats']}\n"
+        if dataset_summary.get("target_distribution"):
+            dataset_summary_text += f"Target class distribution: {dataset_summary['target_distribution']}\n"
+    else:
+        dataset_summary_text = "No dataset summary available for this job."
+
+    # ── NEW: model + SHAP + business summary blocks ──
+    model_summary_text = (
+        f"Best model: {ml_rec.get('best_model','—')}  |  Task: {ml_rec.get('task_type','—')}  |  "
+        f"Target: {ml_rec.get('target_column','—')}  |  Score: {ml_rec.get('best_score','—')}\n"
+        f"Leaderboard: {[(m.get('name'), m.get('score')) for m in ml_rec.get('models', [])]}\n"
+    )
+    shap_text = f"Top feature importances: {ml_rec.get('feature_importances', [])[:10]}"
+    recs_text = f"Business recommendations: {ad.get('actions', [])[:8]}"
+
+    # ── UPDATED system prompt: senior-analyst framing + explicit anti-hallucination rule ──
     system_prompt = (
-        "You are DataMind AI, an expert data analyst assistant embedded in a SaaS analytics platform.\n"
-        f"Dataset: {ad.get('filename', 'Unknown')}\n"
-        f"ML Target: {ml_rec.get('target_column','unknown')}  |  "
-        f"Best Model: {ml_rec.get('best_model','—')}  |  "
-        f"Task: {ml_rec.get('task_type','—')}\n"
-        f"Relevant retrieved context for this question:\n{retrieved_text}\n"
-        "Answer in 2-5 clear sentences, using only the retrieved context above plus the "
-        "model/target info. If the retrieved context doesn't cover the question, say what "
-        "you don't have rather than guessing. If no data is loaded, say so and ask the "
-        "user to upload a CSV first."
+        "You are DataMind AI's analytics copilot — acting as a senior data scientist, "
+        "business analyst, ML engineer, and explainability expert combined.\n\n"
+        f"DATASET SUMMARY:\n{dataset_summary_text}\n"
+        f"MODEL SUMMARY:\n{model_summary_text}\n"
+        f"{shap_text}\n"
+        f"{recs_text}\n"
+        f"RETRIEVED REPORT CONTEXT (for interpretive questions):\n{retrieved_text}\n\n"
+        "Rules:\n"
+        "- If the answer is a number or fact present in DATASET SUMMARY or MODEL SUMMARY above, "
+        "answer directly and confidently — do not say you don't have the data.\n"
+        "- If the question needs interpretation (why a model was chosen, explaining SHAP, "
+        "business meaning, executive summary), use the retrieved report context.\n"
+        "- If something genuinely isn't in any of the sources above, say exactly what's missing "
+        "instead of guessing or inventing a number.\n"
+        "- Never fabricate statistics that aren't in the provided context.\n"
+        "- Keep answers concise: 2-6 sentences unless asked for a structured breakdown."
     )
 
     # Use job_id as chat key; fall back to user email so chat persists across page refreshes
@@ -887,7 +1006,7 @@ def chat():
         client = Groq(api_key=api_key)
         with llmops.track_llm_call(job_id, user["email"], "chat") as ctx:
             comp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile", max_tokens=600, temperature=0.5,
+                model="llama-3.3-70b-versatile", max_tokens=700, temperature=0.4,
                 messages=[{"role": "system", "content": system_prompt}] + history[-12:],
             )
             ctx["response"] = comp
@@ -1169,6 +1288,13 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
                 ),
             })
 
+        # ── NEW: build dataset summary once, store alongside other job results ──
+        try:
+            dataset_summary = build_dataset_summary(df, ctx_safe, ml_rec)
+        except Exception as ds_err:
+            log(job_id, f"[WARN] Dataset summary skipped: {ds_err}")
+            dataset_summary = {}
+
         # Ensure distribution_data is populated from multiple sources
         dist_data = (
             ctx_safe.get("distribution_data")
@@ -1218,6 +1344,7 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
             "dashboard_html": dash_html,
             "industry":       industry_result,
             "eval":           eval_result,
+            "dataset_summary": dataset_summary,   # NEW
         }
 
         # [AG7] Build the RAG index over the full analysis output so /api/chat
