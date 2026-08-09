@@ -412,7 +412,7 @@ function Topbar({ page, theme, setTheme, jobResult }) {
             {t === "light" ? "☀ light" : "🌙 dark"}
           </button>
         ))}
-      </div>
+      </di
     </div>
   );
 }
@@ -421,7 +421,6 @@ function Topbar({ page, theme, setTheme, jobResult }) {
 function UploadPage({ token, onJobDone, setJobMeta }) {
   const [dragging, setDragging] = useState(false);
   const [file, setFile]         = useState(null);
-  const [apiKey, setApiKey]     = useState("");
   const [query, setQuery]       = useState("Give me key insights about this data.");
   const [target, setTarget]     = useState("");
   const [loading, setLoading]   = useState(false);
@@ -460,7 +459,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
     setErr(""); setLoading(true); setJobSt("running"); setLogs([]); setStep(1);
     const fd = new FormData();
     fd.append("file", f); fd.append("query", (overrideOpts && overrideOpts.query) || query);
-    if (apiKey) fd.append("api_key", apiKey);  // optional — server falls back to its own GROQ_API_KEY
+  
     const t = (overrideOpts && overrideOpts.target) ?? target;
     if (t) fd.append("target_column", t);
     if (overrideOpts && overrideOpts.industry) fd.append("industry", overrideOpts.industry);
@@ -471,7 +470,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
       });
       const d = await r.json();
       if (!r.ok) { setErr(d.error); setLoading(false); setJobSt("idle"); return; }
-      setJobMeta({ jobId: d.job_id, apiKey });
+      setJobMeta({ jobId: d.job_id });
       startPoll(d.job_id);
     } catch { setErr("Flask backend unreachable — is it running at " + API_BASE + "?"); setLoading(false); setJobSt("idle"); }
   }
@@ -1075,7 +1074,7 @@ function ChatPage({ token, jobId, savedApiKey }) {
   const [msgs, setMsgs]       = useState([{ role: "assistant", content: "Hi! I'm DataMind AI. Upload a dataset then ask me anything about your data." }]);
   const [input, setInput]     = useState("");
   const [loading, setLoading] = useState(false);
-  const [apiKey, setApiKey]   = useState(savedApiKey || "");
+
   const endRef = useRef(null);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [msgs]);
