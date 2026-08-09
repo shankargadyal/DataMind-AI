@@ -558,11 +558,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
       <div className="card" style={{ padding: 16 }}>
         <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 12 }}>Configuration</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          <div>
-            <label style={{ fontSize: 11, color: "var(--text3)", display: "block", marginBottom: 4 }}>Groq API Key <span style={{ fontStyle: "italic" }}>(optional — leave blank to use this server's configured key)</span></label>
-            <input className="input" type="password" placeholder="gsk_... (optional)" value={apiKey} onChange={e => setApiKey(e.target.value)} />
-          </div>
-          <div>
+          
             <label style={{ fontSize: 11, color: "var(--text3)", display: "block", marginBottom: 4 }}>Analysis Query</label>
             <textarea className="input" value={query} onChange={e => setQuery(e.target.value)} />
           </div>
