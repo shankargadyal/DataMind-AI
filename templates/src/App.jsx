@@ -9,6 +9,7 @@ import {
 const API_BASE =
   window.location.hostname === "localhost"
     ? "http://localhost:5000"
+
     : window.location.origin;
 const CHART_COLORS = ["#D98E2B","#2BA8AF","#4FB88A","#E0566F","#9B6FD9","#4FA8C9","#D9772E","#7AA85C"];
 
@@ -1070,7 +1071,7 @@ function PredictPage({ token, jobId, setPage }) {
 }
 
 // ─── CHAT PAGE ────────────────────────────────────────────────────
-function ChatPage({ token, jobId, savedApiKey }) {
+function ChatPage({ token, jobId }) {
   const [msgs, setMsgs]       = useState([{ role: "assistant", content: "Hi! I'm DataMind AI. Upload a dataset then ask me anything about your data." }]);
   const [input, setInput]     = useState("");
   const [loading, setLoading] = useState(false);
@@ -1085,9 +1086,11 @@ function ChatPage({ token, jobId, savedApiKey }) {
     setMsgs(p => [...p, { role: "user", content: txt }]);
     setLoading(true);
     try {
+      // NEW: no api_key sent from the client anymore — the backend falls
+      // back to its own GROQ_API_KEY env var when this is omitted.
       const r = await apiFetch("/api/chat", {
         method: "POST",
-        body: JSON.stringify({ message: txt, job_id: jobId || "", api_key: apiKey }),
+        body: JSON.stringify({ message: txt, job_id: jobId || "" }),
       }, token);
       const d = await r.json();
       setMsgs(p => [...p, { role: "assistant", content: d.reply || d.error || "Error — please try again." }]);
@@ -1119,11 +1122,7 @@ function ChatPage({ token, jobId, savedApiKey }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10, height: "calc(100vh - 136px)", animation: "fadeIn .2s ease" }}>
-      {!savedApiKey && (
-        <div className="card" style={{ padding: "10px 14px" }}>
-          <input className="input" type="password" placeholder="Groq API key for chat (gsk_...)" value={apiKey} onChange={e => setApiKey(e.target.value)} />
-        </div>
-      )}
+      
       <div className="card scrollbar" style={{ flex: 1, padding: 16, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
         {msgs.map((m, i) => <Bubble key={i} m={m} />)}
         {loading && (
@@ -1390,9 +1389,7 @@ function DashboardPage({ jobResult, jobStep, jobStatus, jobStepHistory, setPage 
 function AppShell({ user, token, onLogout }) {
   const [page, setPage]         = useState("dashboard");
   const [theme, setTheme]       = useState("light");
-  const [jobId, setJobId]       = useState(null);
   const [savedApiKey, setSavedKey] = useState("");
-  const [jobResult, setResult]  = useState(null);
   const [jobStep, setStep]      = useState(0);
   const [jobStatus, setStatus]  = useState("idle");
   const [jobStepHistory, setJobStepHistory] = useState([]);
