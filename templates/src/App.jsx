@@ -9,7 +9,6 @@ import {
 const API_BASE =
   window.location.hostname === "localhost"
     ? "http://localhost:5000"
-
     : window.location.origin;
 const CHART_COLORS = ["#D98E2B","#2BA8AF","#4FB88A","#E0566F","#9B6FD9","#4FA8C9","#D9772E","#7AA85C"];
 
@@ -413,7 +412,7 @@ function Topbar({ page, theme, setTheme, jobResult }) {
             {t === "light" ? "☀ light" : "🌙 dark"}
           </button>
         ))}
-      </di
+      </div>
     </div>
   );
 }
@@ -460,7 +459,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
     setErr(""); setLoading(true); setJobSt("running"); setLogs([]); setStep(1);
     const fd = new FormData();
     fd.append("file", f); fd.append("query", (overrideOpts && overrideOpts.query) || query);
-  
+
     const t = (overrideOpts && overrideOpts.target) ?? target;
     if (t) fd.append("target_column", t);
     if (overrideOpts && overrideOpts.industry) fd.append("industry", overrideOpts.industry);
@@ -558,7 +557,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
       <div className="card" style={{ padding: 16 }}>
         <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 12 }}>Configuration</div>
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          
+          <div>
             <label style={{ fontSize: 11, color: "var(--text3)", display: "block", marginBottom: 4 }}>Analysis Query</label>
             <textarea className="input" value={query} onChange={e => setQuery(e.target.value)} />
           </div>
@@ -1071,6 +1070,10 @@ function PredictPage({ token, jobId, setPage }) {
 }
 
 // ─── CHAT PAGE ────────────────────────────────────────────────────
+// NOTE: the Groq API key input that used to live at the top of this page has
+// been removed entirely. The backend's /api/chat already falls back to its
+// own GROQ_API_KEY environment variable whenever the client sends none, so
+// nothing here needs to collect, store, or transmit a key anymore.
 function ChatPage({ token, jobId }) {
   const [msgs, setMsgs]       = useState([{ role: "assistant", content: "Hi! I'm DataMind AI. Upload a dataset then ask me anything about your data." }]);
   const [input, setInput]     = useState("");
@@ -1086,8 +1089,6 @@ function ChatPage({ token, jobId }) {
     setMsgs(p => [...p, { role: "user", content: txt }]);
     setLoading(true);
     try {
-      // NEW: no api_key sent from the client anymore — the backend falls
-      // back to its own GROQ_API_KEY env var when this is omitted.
       const r = await apiFetch("/api/chat", {
         method: "POST",
         body: JSON.stringify({ message: txt, job_id: jobId || "" }),
@@ -1122,7 +1123,6 @@ function ChatPage({ token, jobId }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10, height: "calc(100vh - 136px)", animation: "fadeIn .2s ease" }}>
-      
       <div className="card scrollbar" style={{ flex: 1, padding: 16, overflowY: "auto", display: "flex", flexDirection: "column", gap: 12 }}>
         {msgs.map((m, i) => <Bubble key={i} m={m} />)}
         {loading && (
@@ -1389,7 +1389,8 @@ function DashboardPage({ jobResult, jobStep, jobStatus, jobStepHistory, setPage 
 function AppShell({ user, token, onLogout }) {
   const [page, setPage]         = useState("dashboard");
   const [theme, setTheme]       = useState("light");
-  const [savedApiKey, setSavedKey] = useState("");
+  const [jobId, setJobId]       = useState(null);
+  const [jobResult, setResult]  = useState(null);
   const [jobStep, setStep]      = useState(0);
   const [jobStatus, setStatus]  = useState("idle");
   const [jobStepHistory, setJobStepHistory] = useState([]);
@@ -1400,8 +1401,10 @@ function AppShell({ user, token, onLogout }) {
     setResult(result); setStatus("done"); setJobStepHistory(stepHist || []); setPage("insights");
   }
 
-  function setJobMeta({ jobId, apiKey }) {
-    setJobId(jobId); setSavedKey(apiKey); setStep(1); setStatus("running");
+  // NOTE: no longer accepts/stores an apiKey — the chat API key box was
+  // removed from ChatPage, and /api/analyze never needed one to begin with.
+  function setJobMeta({ jobId }) {
+    setJobId(jobId); setStep(1); setStatus("running");
   }
 
   return (
@@ -1416,7 +1419,7 @@ function AppShell({ user, token, onLogout }) {
           {page === "charts"    && <ChartsPage    jobResult={jobResult} setPage={setPage} />}
           {page === "ml"        && <MLResultsPage jobResult={jobResult} setPage={setPage} />}
           {page === "predict"   && <PredictPage   token={token} jobId={jobId} setPage={setPage} />}
-          {page === "chat"      && <ChatPage      token={token} jobId={jobId} savedApiKey={savedApiKey} />}
+          {page === "chat"      && <ChatPage      token={token} jobId={jobId} />}
           {page === "report"    && <ReportPage    token={token} jobId={jobId} jobResult={jobResult} setPage={setPage} />}
           {page === "history"   && <HistoryPage   token={token} setPage={setPage} />}
         </div>
