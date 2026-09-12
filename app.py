@@ -1006,7 +1006,7 @@ def chat():
         client = Groq(api_key=api_key)
         with llmops.track_llm_call(job_id, user["email"], "chat") as ctx:
             comp = client.chat.completions.create(
-                model="llama-3.3-70b-versatile", max_tokens=700, temperature=0.4,
+                model="openai/gpt-oss-120b", max_tokens=700, temperature=0.4,
                 messages=[{"role": "system", "content": system_prompt}] + history[-12:],
             )
             ctx["response"] = comp
@@ -1172,8 +1172,8 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
             cleaned_path = filepath
 
         set_step(job_id, 2, "Finding AI insights")
-        log(job_id, "[AG2] Sending to Groq LLaMA 3.3 70B...")
-
+        log(job_id, "[AG2] Sending request to Groq GPT-OSS 120B...")
+      
         safe_det = _safe_ctx(det)
         ana = analyst.run_analyst(safe_det, query, api_key, job_id=job_id, user_email=jobs[job_id].get("user"))
         if target_column:
