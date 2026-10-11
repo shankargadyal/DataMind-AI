@@ -194,18 +194,33 @@ def _get_models(task_type: str):
     return models
 
 
-def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type: str) -> dict:
+def _safe_cv(model, X_train, y_train, scoring: str, task_type: str):
+    """Cross-validated score on the TRAINING split only. Returns (mean, std, folds, note).
+    Returns (None, None, 0, reason) when CV is not statistically valid — never a fake 0.0."""
+    from sklearn.base import clone
+    if task_type == "classification":
+        _, counts = np.unique(y_train, return_counts=True)
+        folds = int(min(3, counts.min())) if len(counts) else 0
+        if folds < 2:
+            return None, None, 0, "cross-validation skipped: smallest class in the training split has < 2 members"
+    else:
+        folds = 3 if len(y_train) >= 30 else 0
+        if folds < 2:
+            return None, None, 0, "cross-validation skipped: too few training rows"
+    try:
+        cv = cross_val_score(clone(model), X_train, y_train, cv=folds, scoring=scoring)
+        return round(float(cv.mean()), 4), round(float(cv.std()), 4), folds, ""
+    except Exception as e:
+        return None, None, 0, f"cross-validation failed: {type(e).__name__}"
+
+
+def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type: str, n_classes: int = 0) -> dict:
     y_pred = model.predict(X_test)
     if task_type == "classification":
         avg = "weighted"
-        cm  = confusion_matrix(y_test, y_pred).tolist()
-        # Cross-val on training set
-        try:
-            cv = cross_val_score(model, X_train, y_train, cv=3, scoring="accuracy")
-            cv_mean = round(float(cv.mean()), 4)
-            cv_std  = round(float(cv.std()), 4)
-        except Exception:
-            cv_mean, cv_std = 0.0, 0.0
+        labels = list(range(n_classes)) if n_classes else None
+        cm = confusion_matrix(y_test, y_pred, labels=labels).tolist()
+        cv_mean, cv_std, folds, cv_note = _safe_cv(model, X_train, y_train, "accuracy", task_type)
         return {
             "accuracy":          round(float(accuracy_score(y_test, y_pred)), 4),
             "precision":         round(float(precision_score(y_test, y_pred, average=avg, zero_division=0)), 4),
@@ -214,22 +229,48 @@ def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type: str) -> di
             "confusion_matrix":  cm,
             "cv_score":          cv_mean,
             "cv_std":            cv_std,
+            "cv_folds":          folds,
+            "cv_note":           cv_note,
+            "n_test":            int(len(y_test)),
         }
+    rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
+    cv_mean, cv_std, folds, cv_note = _safe_cv(model, X_train, y_train, "r2", task_type)
+    return {
+        "r2":       round(float(r2_score(y_test, y_pred)), 4),
+        "mae":      round(float(mean_absolute_error(y_test, y_pred)), 4),
+        "rmse":     round(rmse, 4),
+        "cv_score": cv_mean,
+        "cv_std":   cv_std,
+        "cv_folds": folds,
+        "cv_note":  cv_note,
+        "n_test":   int(len(y_test)),
+    }
+
+
+def _plan_split(y, task_type: str, test_size: float) -> dict:
+    """Decide whether a stratified split is valid BEFORE calling train_test_split."""
+    plan = {"stratify": False, "warnings": [], "class_counts": {}}
+    if task_type != "classification":
+        return plan
+    classes, counts = np.unique(y, return_counts=True)
+    plan["class_counts"] = {int(c): int(n) for c, n in zip(classes, counts)}
+    n_test = int(np.ceil(len(y) * test_size))
+    if counts.min() >= 2 and n_test >= len(classes) and (len(y) - n_test) >= len(classes):
+        plan["stratify"] = True
     else:
-        rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-        try:
-            cv = cross_val_score(model, X_train, y_train, cv=3, scoring="r2")
-            cv_mean = round(float(cv.mean()), 4)
-            cv_std  = round(float(cv.std()), 4)
-        except Exception:
-            cv_mean, cv_std = 0.0, 0.0
-        return {
-            "r2":       round(float(r2_score(y_test, y_pred)), 4),
-            "mae":      round(float(mean_absolute_error(y_test, y_pred)), 4),
-            "rmse":     round(rmse, 4),
-            "cv_score": cv_mean,
-            "cv_std":   cv_std,
-        }
+        rare = [int(c) for c, n in zip(classes, counts) if n < 2]
+        if rare:
+            plan["warnings"].append(
+                f"{len(rare)} target class(es) have only 1 member; a stratified split is impossible, "
+                "so a plain random split was used. Rare classes were kept (not removed); "
+                "metrics for them are not reliable."
+            )
+        elif n_test < len(classes):
+            plan["warnings"].append("Test split is smaller than the number of classes; a plain random split was used.")
+    few = [int(c) for c, n in zip(classes, counts) if 2 <= n < 5]
+    if few:
+        plan["warnings"].append(f"{len(few)} class(es) have fewer than 5 members — per-class metrics are unreliable.")
+    return plan
 
 
 # ── SHAP / feature importance ───────────────────────────────────────────────
@@ -268,7 +309,7 @@ def _get_feature_importance(model, X_sample: np.ndarray, feature_cols: list) -> 
         importances.sort(key=lambda x: x["importance"], reverse=True)
         return importances[:15]
 
-    return [{"feature": col, "importance": 0.0, "method": "none"} for col in feature_cols[:10]]
+    return []   # no honest importance available for this model type — never fabricate scores
 
 
 # ── Future prediction ───────────────────────────────────────────────────────
@@ -397,8 +438,23 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
     if not feature_cols:
         return {"error": "No features available after engineering", "models": []}
 
-    X = df_feat[feature_cols].values
-    y_raw = df_feat[target_col].values if target_col in df_feat.columns else df[target_col].values
+    # Drop columns that cannot carry generalisable signal: identifiers & constants.
+    # (Label-encoded IDs/names behave like noise or leak row identity.)
+    skip = set(det.get("identifier_columns", []) or []) | set(det.get("constant_columns", []) or [])
+    dropped_features = [c for c in feature_cols if c in skip and c != target_col]
+    feature_cols = [c for c in feature_cols if c not in skip]
+    if not feature_cols:
+        return {"error": "No usable features after removing identifier/constant columns", "models": []}
+
+    # Rows whose target was missing in the ORIGINAL file must not be trained on with an imputed label.
+    df_raw = det.get("df_raw")
+    target_missing_dropped = 0
+    row_ok = np.ones(len(df_feat), dtype=bool)
+    if isinstance(df_raw, pd.DataFrame) and target_col in df_raw.columns and len(df_raw) == len(df_feat):
+        row_ok = df_raw[target_col].notna().values
+        target_missing_dropped = int((~row_ok).sum())
+    X = df_feat.loc[row_ok, feature_cols].values
+    y_raw = (df_feat[target_col] if target_col in df_feat.columns else df[target_col]).values[row_ok]
 
     detected_task = _detect_task(pd.Series(y_raw))
     analyst_task = (ml_rec.get("task_type") or "").strip().lower()
@@ -414,65 +470,95 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
     le_target = None
     if task_type == "classification":
         le_target = LabelEncoder()
-        y = le_target.fit_transform(y_raw.astype(str))
+        y = le_target.fit_transform(pd.Series(y_raw).astype(str).values)
     else:
         y = y_raw.astype(float)
 
-    # Remove NaN rows
     mask = ~np.isnan(y.astype(float)) if task_type == "regression" else np.ones(len(y), dtype=bool)
+    target_missing_dropped += int((~mask).sum())
     X, y = X[mask], y[mask]
     if len(X) < 20:
         return {"error": "Not enough data rows (need ≥ 20)", "models": []}
 
-    # Class imbalance check
+    eval_warnings = []
+    if target_missing_dropped:
+        eval_warnings.append(f"{target_missing_dropped} row(s) with a missing target were excluded from model training (not imputed).")
+    if dropped_features:
+        eval_warnings.append(f"Identifier/constant columns excluded from features: {', '.join(dropped_features[:8])}.")
+
+    n_classes = 0
+    if task_type == "classification":
+        n_classes = int(len(np.unique(y)))
+        if n_classes < 2:
+            return {
+                "error": "Classification evaluation impossible: the target has only one class.",
+                "models": [], "task_type": "classification", "target_column": target_col,
+                "classification_skipped": True, "evaluation_warnings": eval_warnings,
+                "class_imbalance": _class_imbalance(y),
+            }
+
     imbalance = _class_imbalance(y) if task_type == "classification" else {}
 
-    # Scale
-    scaler   = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-
-    # Train/test split
     test_size = 0.2 if len(X) > 100 else 0.15
-    split_kwargs = {
-        "test_size": test_size,
-        "random_state": 42,
-    }
+    plan = _plan_split(y, task_type, test_size)
+    eval_warnings += plan["warnings"]
+    split_kwargs = {"test_size": test_size, "random_state": 42}
     if det.get("is_timeseries") and task_type == "regression":
         split_kwargs["shuffle"] = False
-    elif task_type == "classification":
+    elif plan["stratify"]:
         split_kwargs["stratify"] = y
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, **split_kwargs)
+    try:
+        X_train_raw, X_test_raw, y_train, y_test = train_test_split(X, y, **split_kwargs)
+    except ValueError as e:
+        split_kwargs.pop("stratify", None)
+        eval_warnings.append(f"Stratified split failed ({e}); a plain random split was used.")
+        X_train_raw, X_test_raw, y_train, y_test = train_test_split(X, y, **split_kwargs)
 
-    # Polynomial features (only if ≤ 30 features to avoid memory issues)
+    # Fit the scaler on the TRAINING split only (no test-set leakage).
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train_raw)
+    X_test = scaler.transform(X_test_raw)
+    X_scaled = X_train   # sample used below for importance/SHAP: real trained-model feature space
     poly_feature_cols = feature_cols[:]
 
-    # Train models
-    model_results, best_model_obj, best_score, best_name = [], None, -np.inf, ""
+    primary_metric = "accuracy" if task_type == "classification" else "r2"
+    evaluation_protocol = {
+        "split": "hold-out test set",
+        "n_train": int(len(y_train)), "n_test": int(len(y_test)),
+        "stratified": bool(split_kwargs.get("stratify") is not None),
+        "random_state": 42,
+        "reported_metric": primary_metric,
+        "selection_rule": "highest cross-validated score on the training split (falls back to hold-out score if CV is not valid)",
+    }
 
+    model_results, best_model_obj, best_sel, best_name = [], None, -np.inf, ""
     for name, clf in _get_models(task_type):
         try:
             clf.fit(X_train, y_train)
-            metrics = _eval_metrics(clf, X_train, X_test, y_train, y_test, task_type)
-            holdout_score = metrics.get("accuracy") if task_type == "classification" else metrics.get("r2", 0)
-            score = metrics.get("cv_score", holdout_score)
+            metrics = _eval_metrics(clf, X_train, X_test, y_train, y_test, task_type, n_classes)
+            holdout = metrics.get(primary_metric)
+            cvm = metrics.get("cv_score")
+            sel = cvm if cvm is not None else holdout
+            # "score" is ALWAYS the hold-out metric so comparison table == detailed metrics.
             model_results.append({
-                "name": name, "score": round(float(score), 4),
+                "name": name, "score": round(float(holdout), 4), "score_metric": primary_metric,
+                "cv_score": cvm, "selection_score": round(float(sel), 4),
                 "metrics": metrics, "is_best": False, "_obj": clf,
             })
-            if score > best_score:
-                best_score, best_model_obj, best_name = score, clf, name
+            if sel > best_sel:
+                best_sel, best_model_obj, best_name = sel, clf, name
         except Exception as e:
             model_results.append({"name": name, "score": 0, "metrics": {}, "is_best": False, "error": str(e)})
 
     for m in model_results:
         m["is_best"] = (m["name"] == best_name)
+    best_entry = next((m for m in model_results if m["is_best"]), None)
+    best_score = float(best_entry["score"]) if best_entry else 0.0
 
-    # Feature importance
     feature_importances = []
     if best_model_obj is not None:
         feature_importances = _get_feature_importance(best_model_obj, X_scaled[:200], poly_feature_cols)
 
-    # SHAP summary + waterfall plots for the dashboard / report (Agent 4: Explainability)
     shap_plots = {"available": False, "reason": "not computed"}
     if best_model_obj is not None:
         try:
@@ -481,12 +567,10 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
         except Exception as e:
             shap_plots = {"available": False, "reason": str(e)}
 
-    # Future prediction
     future_pred = {}
     if det.get("is_timeseries") and task_type == "regression" and best_model_obj is not None:
         future_pred = _future_prediction(best_model_obj, scaler, feature_cols, df_feat, target_col)
 
-    # Clean model list
     clean_models = [{k: v for k, v in m.items() if k != "_obj"} for m in model_results]
 
     return {
@@ -502,6 +586,10 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
         "future_prediction":    future_pred,
         "class_imbalance":      imbalance,
         "exploratory_mode":     False,
+        "score_metric":         primary_metric,
+        "evaluation_protocol":  evaluation_protocol,
+        "evaluation_warnings":  eval_warnings,
+        "selection_metric":     "cv_score",
         # Private objects
         "_model_obj":    best_model_obj,
         "_scaler_obj":   scaler,
