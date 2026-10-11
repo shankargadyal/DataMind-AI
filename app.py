@@ -145,6 +145,7 @@ def _port_open(host: str, port: int, timeout: float = 0.25) -> bool:
 # ── Agents ────────────────────────────────────────────────────────
 from agents import detective, analyst, ml_engineer, reporter
 from agents import rag_agent, evaluator
+from agents import query_engine, data_store
 
 HAS_PDF = False
 generate_pdf_report = None
@@ -357,10 +358,13 @@ def _current_user() -> dict | None:
         u = get_user_by_email(email)
         if u:
             return {"name": u.name, "email": u.email}
-    name  = request.headers.get("X-User-Name", "")
-    email = request.headers.get("X-User-Email", "")
-    if name and email:
-        return {"name": name, "email": email}
+    # Unverified identity headers would let any caller impersonate any user (and read their jobs).
+    # Disabled unless explicitly enabled for local development/tests.
+    if os.environ.get("ALLOW_HEADER_AUTH", "0") == "1":
+        name  = request.headers.get("X-User-Name", "")
+        email = request.headers.get("X-User-Email", "")
+        if name and email:
+            return {"name": name, "email": email}
     return None
 
 def _require_auth():
@@ -396,7 +400,11 @@ def _safe_val(v):
     return v
 
 def _safe_ctx(det: dict) -> dict:
-    return {k: _safe_val(v) for k, v in det.items()}
+    return {k: _safe_val(v) for k, v in det.items() if k != "df_raw"}
+
+
+class DatasetError(Exception):
+    """Raised when the uploaded file cannot be read/validated (distinct from model/LLM failures)."""
 
 def _safe_ml(ml: dict) -> dict:
     return {k: _safe_val(v) for k, v in ml.items() if not k.startswith("_")}
@@ -406,68 +414,63 @@ def _safe_ml(ml: dict) -> dict:
 # Pulls together stats that already exist elsewhere in the pipeline
 # (column_stats, correlation, categorical value_counts) into one dict
 # so /api/chat can answer numeric/structural questions without RAG.
-def build_dataset_summary(df: pd.DataFrame, ctx_safe: dict, ml_rec: dict) -> dict:
+def _num(v, nd=2):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return None if (np.isnan(f) or np.isinf(f)) else round(f, nd)
+
+
+def build_dataset_summary(df: pd.DataFrame, ctx_safe: dict, ml_rec: dict, df_clean: pd.DataFrame | None = None) -> dict:
+    """Summary of the ORIGINAL uploaded data (`df`), so missing values/duplicates/dtypes are real.
+    `df_clean` (optional) is only used to report what cleaning changed."""
+    num_cols = [str(c) for c in df.columns if pd.api.types.is_numeric_dtype(df[c]) and not pd.api.types.is_bool_dtype(df[c])]
+    cat_cols = [str(c) for c in df.columns if str(c) not in num_cols]
+    missing = {str(c): int(df[c].isna().sum()) for c in df.columns}
     summary = {
+        "data_source": "original uploaded file (before cleaning)",
         "num_rows": int(len(df)),
         "num_columns": int(len(df.columns)),
-        "column_names": list(df.columns),
-        "numeric_columns": ctx_safe.get("numeric_cols", []),
-        "categorical_columns": ctx_safe.get("categorical_cols", []),
-        "dtypes": {col: str(df[col].dtype) for col in df.columns},
-        "missing_values": {col: int(df[col].isna().sum()) for col in df.columns},
+        "column_names": [str(c) for c in df.columns],
+        "numeric_columns": num_cols,
+        "categorical_columns": cat_cols,
+        "dtypes": {str(col): str(df[col].dtype) for col in df.columns},
+        "missing_values": missing,                       # ORIGINAL counts (kept key name for API compatibility)
+        "missing_values_total": int(sum(missing.values())),
+        "missing_pct": {c: round(100.0 * n / max(len(df), 1), 2) for c, n in missing.items()},
         "duplicate_rows": int(df.duplicated().sum()),
+        "constant_columns": ctx_safe.get("constant_columns", []),
+        "identifier_columns": ctx_safe.get("identifier_columns", []),
+        "high_cardinality_columns": ctx_safe.get("high_cardinality_columns", []),
     }
+    if df_clean is not None:
+        summary["missing_values_after_cleaning"] = {str(c): int(df_clean[c].isna().sum()) for c in df_clean.columns}
+        summary["cleaning_summary"] = ctx_safe.get("cleaning_summary", {})
 
-    # describe() gives min/max/mean/median/std for every numeric column in
-    # one pass — reused instead of recomputing per-column with pandas calls.
-    if summary["numeric_columns"]:
-        desc = df[summary["numeric_columns"]].describe().to_dict()
+    if num_cols:
+        desc = df[num_cols].describe()
         summary["numeric_stats"] = {
-            col: {
-                "min": round(float(v.get("min", 0)), 2),
-                "max": round(float(v.get("max", 0)), 2),
-                "mean": round(float(v.get("mean", 0)), 2),
-                "median": round(float(df[col].median()), 2) if col in df else None,
-                "std": round(float(v.get("std", 0)), 2),
-            }
-            for col, v in desc.items()
+            col: {"min": _num(desc.at["min", col]), "max": _num(desc.at["max", col]), "mean": _num(desc.at["mean", col]),
+                  "median": _num(df[col].median()), "std": _num(desc.at["std", col]), "non_null": int(df[col].notna().sum())}
+            for col in num_cols
         }
     else:
         summary["numeric_stats"] = {}
 
-    # Common named columns get a shortcut entry so the LLM doesn't have to
-    # search numeric_stats by exact column name (which varies per dataset).
-    def _find_col(*candidates):
-        for c in df.columns:
-            if c.lower() in candidates:
-                return c
-        return None
-
-    age_col = _find_col("age")
-    if age_col:
-        summary["age_stats"] = summary["numeric_stats"].get(age_col)
-
-    income_col = _find_col("salary", "monthlyincome", "income")
-    if income_col:
-        summary["income_stats"] = summary["numeric_stats"].get(income_col)
-
-    # Target class distribution, if this was a classification job
     target_col = ml_rec.get("target_column")
     if target_col and target_col in df.columns:
-        summary["target_distribution"] = df[target_col].value_counts().to_dict()
+        summary["target_column"] = target_col
+        summary["target_distribution"] = {str(k): int(v) for k, v in df[target_col].value_counts(dropna=True).items()}
+        summary["target_missing"] = int(df[target_col].isna().sum())
 
-    # Top correlated pairs, reusing whatever Detective already computed
     corr = ctx_safe.get("correlation", {})
+    summary["correlation_available"] = bool(corr)
     if corr:
-        summary["correlation_available"] = True
         summary["correlation"] = corr
-    else:
-        summary["correlation_available"] = False
 
-    # First 10 rows, kept as records so /api/chat can return them verbatim
-    # without asking the LLM to reproduce tabular data from memory.
-    summary["preview_rows"] = df.head(10).to_dict(orient="records")
-
+    # First rows verbatim; to_json converts NaN -> null so the payload is valid JSON
+    summary["preview_rows"] = json.loads(df.head(10).to_json(orient="records", date_format="iso"))
     return summary
 
 
@@ -635,6 +638,10 @@ def analyze():
     file.save(filepath)
 
     job_id = f"job_{uid}"
+    try:
+        data_store.register(app.config["UPLOAD_FOLDER"], job_id, user["email"], filepath, filename)
+    except OSError as e:
+        return jsonify({"error": f"Could not persist upload: {e}", "error_type": "storage_error"}), 500
     jobs[job_id] = {
         "status": "running", "step": 0, "step_name": "Starting...",
         "logs": [], "result": None, "error": None,
@@ -657,6 +664,7 @@ def status(job_id):
         "status": job["status"], "step": job["step"],
         "step_name": job.get("step_name", ""),
         "logs": job["logs"], "error": job.get("error"),
+        "error_type": job.get("error_type"),
         "step_history": job.get("step_history", []),
         "total_duration": job.get("total_duration"),
         "server_time": time.time(),
@@ -900,45 +908,168 @@ def whatif(job_id):
 # CHAT
 # ══════════════════════════════════════════════════════════════════
 
+_COMPUTE_HINT = re.compile(
+    r"\b(how many|number of|count|average|mean|median|minimum|maximum|std|sum|total|percentage|percent|"
+    r"missing|null|duplicate|compare|rows|columns|group by|crosstab|unique|distinct)\b", re.IGNORECASE)
+_NUM_RE = re.compile(r"(?<![\w.])-?\d[\d,]*\.?\d*")
+
+
+def _collect_numbers(obj, out: set):
+    if isinstance(obj, bool):
+        return
+    if isinstance(obj, (int, float)):
+        out.add(float(obj))
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            _collect_numbers(v, out)
+    elif isinstance(obj, (list, tuple)):
+        for v in obj:
+            _collect_numbers(v, out)
+    elif isinstance(obj, str):
+        for m in _NUM_RE.findall(obj):
+            try:
+                out.add(float(m.replace(",", "")))
+            except ValueError:
+                pass
+
+
+def _llm_numbers_ok(llm_text: str, computed: dict) -> bool:
+    """True only if every number the LLM wrote traces back to a computed value (tolerance for rounding)."""
+    allowed: set = set()
+    _collect_numbers(computed.get("values"), allowed)
+    _collect_numbers(computed.get("filters"), allowed)
+    for m in _NUM_RE.findall(llm_text):
+        try:
+            v = float(m.replace(",", ""))
+        except ValueError:
+            continue
+        if v in (0.0, 1.0, 2.0, 100.0):          # structural numbers (e.g. "group 1", "100%")
+            continue
+        if not any(abs(v - a) <= 0.5 or (a and abs(v - a) / abs(a) <= 0.005) for a in allowed):
+            return False
+    return True
+
+
+def _groq_error_response(e: Exception):
+    err_str = str(e).lower()
+    name = type(e).__name__.lower()
+    if "timeout" in name or "timed out" in err_str:
+        return jsonify({"error": "The AI service timed out. Please try again.", "error_type": "timeout"}), 504
+    if "api_key" in err_str or "authentication" in err_str or "invalid api key" in err_str:
+        return jsonify({"error": "Invalid Groq API key. Please check your key in settings.", "error_type": "llm_auth"}), 401
+    if "rate" in err_str:
+        return jsonify({"error": "Groq rate limit hit. Please wait a moment and try again.", "error_type": "llm_rate_limit"}), 429
+    return jsonify({"error": f"Chat error: {e}", "error_type": "llm_error"}), 500
+
+
 @app.route("/api/chat", methods=["POST"])
 @_rate_limit("30/minute")
 def chat():
-    user, err = _require_auth()   # BUG-04 — unchanged
+    user, err = _require_auth()
     if err: return err
 
-    from groq import Groq
     b       = request.get_json(force=True)
     message = b.get("message", "").strip()
     job_id  = b.get("job_id", "")
     api_key = b.get("api_key", "").strip() or GROQ_API_KEY
     if not message: return jsonify({"error": "Empty message"}), 400
-    if not api_key: return jsonify({"error": "API key required"}), 400
 
-    job = jobs.get(job_id, {})
+    folder = app.config["UPLOAD_FOLDER"]
+    job = jobs.get(job_id, {}) if job_id else {}
     if job_id:
-        if not job:
-            return jsonify({"error": "Job not found"}), 404
-        if job.get("user") not in ("guest@datamind.ai", user["email"]):
-            return jsonify({"error": "Forbidden"}), 403
+        if job:
+            if job.get("user") not in ("guest@datamind.ai", user["email"]):
+                return jsonify({"error": "Forbidden"}), 403
+        else:
+            # Job state lives in this process only. If another Cloud Run instance (or a restart)
+            # lost it, the persisted dataset can still answer calculations for the right owner.
+            meta = data_store.load_meta(folder, job_id) if re.match(r"^job_[0-9a-f]{32}$", job_id) else None
+            if not meta:
+                return jsonify({"error": "Job not found", "error_type": "job_not_found"}), 404
+            if not data_store.owner_allowed(meta, user["email"]):
+                return jsonify({"error": "Forbidden"}), 403
+
+    chat_key = job_id if job_id else f"user_{(user or {}).get('email','anon')}"
+    history = _chats.setdefault(chat_key, [])
 
     result = job.get("result") or {}
     ad = result.get("analysis_data", {})
     ml_rec = ad.get("ml_recommendation", {})
-    dataset_summary = result.get("dataset_summary", {})   # NEW
+    dataset_summary = result.get("dataset_summary", {})
 
-    # ── NEW: deterministic short-circuit for row-preview requests ──
-    # Avoids asking the LLM to reproduce tabular data, which it will
-    # paraphrase or drop rows on. Regex is intentionally narrow so it
-    # only fires on clear "show me rows" style phrasing.
+    # ── 1. Deterministic calculation on the ORIGINAL dataset (before any LLM) ──
+    computed = None
+    if job_id:
+        df_orig, derr = data_store.get_dataframe(folder, job_id, user["email"], "raw")
+        if df_orig is not None:
+            computed = query_engine.answer_question(df_orig, message)
+        elif _COMPUTE_HINT.search(message):
+            computed = query_engine.answer_question(None, message)
+            computed["limitations"] = [derr or "dataset_unavailable"]
+            computed["text"] = data_store.ERROR_MESSAGES.get(derr, computed["text"])
+
+    def _finish(reply, source, extra=None):
+        history.append({"role": "user", "content": message})
+        history.append({"role": "assistant", "content": reply})
+        out = {"reply": reply, "chat_key": chat_key, "source": source}
+        if extra: out.update(extra)
+        return jsonify(out)
+
+    comp_payload = None
+    if computed and computed.get("handled"):
+        comp_payload = {k: computed.get(k) for k in ("operation", "filters", "values", "limitations", "interpretations", "status")}
+        if computed["status"] in ("clarify", "no_match", "error"):
+            code = {"error": "dataset_unavailable", "no_match": "invalid_query", "clarify": "needs_clarification"}[computed["status"]]
+            return _finish(computed["text"], "computed", {"computed": comp_payload, "error_type": code})
+
+    # ── 2. Fast path: computed result, optional LLM explanation of that result ──
+    if comp_payload:
+        reply = "**Computed from your uploaded data**\n\n" + computed["text"]
+        if computed.get("limitations"):
+            reply += "\n\n_Notes:_ " + " ".join(computed["limitations"])
+        explain = os.environ.get("CHAT_LLM_EXPLAIN", "1") == "1" and api_key
+        if explain:
+            try:
+                from groq import Groq
+                from agents import llmops
+                evidence = query_engine.evidence_for_llm(computed)
+                sys_p = (
+                    "You are DataMind AI's analytics copilot. COMPUTED EVIDENCE below was calculated "
+                    "deterministically from the user's actual dataset and is the ONLY source of numbers.\n"
+                    f"COMPUTED EVIDENCE: {evidence}\n\n"
+                    "Write 2-3 sentences of plain-language interpretation of this result. Rules: "
+                    "never change, recompute, round differently, or add any number that is not in the evidence; "
+                    "do not claim causation; state limitations (e.g. missing values excluded) if listed; "
+                    "this is a general interpretation, not a new calculation."
+                )
+                client = Groq(api_key=api_key, timeout=float(os.environ.get("LLM_TIMEOUT_S", 30)), max_retries=1)
+                with llmops.track_llm_call(job_id, user["email"], "chat") as ctx:
+                    comp = client.chat.completions.create(
+                        model="openai/gpt-oss-120b", max_tokens=350, temperature=0.2,
+                        messages=[{"role": "system", "content": sys_p}] + history[-6:] + [{"role": "user", "content": message}],
+                    )
+                    ctx["response"] = comp
+                note = (comp.choices[0].message.content or "").strip()
+                if note and _llm_numbers_ok(note, computed):
+                    reply += "\n\n**Interpretation (AI, general):** " + note
+                    return _finish(reply, "computed+llm", {"computed": comp_payload})
+                reply += "\n\n_(AI interpretation withheld: it contained numbers not present in the computed results.)_"
+            except Exception as e:
+                logger.warning("Chat explanation skipped: %s", e)
+                reply += "\n\n_(AI interpretation unavailable right now; the calculation above is unaffected.)_"
+        return _finish(reply, "computed", {"computed": comp_payload})
+
+    # ── 3. Not a computable question: RAG + model/report context (clearly labelled) ──
+    if not api_key: return jsonify({"error": "API key required", "error_type": "llm_auth"}), 400
+    from groq import Groq
+
     row_request = re.search(r"\b(first|top)\s+(\d{1,3})\s+rows?\b", message.lower())
     if row_request and dataset_summary.get("preview_rows"):
         n = min(int(row_request.group(2)), len(dataset_summary["preview_rows"]))
         rows = dataset_summary["preview_rows"][:n]
-        reply = f"Here are the first {n} rows:\n\n" + json.dumps(rows, indent=2, default=str)
-        return jsonify({"reply": reply, "chat_key": job_id or "preview"})
+        reply = f"Here are the first {n} rows (original data, missing values shown as null):\n\n" + json.dumps(rows, indent=2, default=str)
+        return _finish(reply, "computed")
 
-    # RAG: unchanged — retrieval over the full analysis output (TF-IDF index,
-    # not embeddings — this app never used a vector DB, see rag_agent.py)
     rag_index = job.get("rag_index")
     retrieved_text = "None available."
     if rag_index is not None:
@@ -946,81 +1077,63 @@ def chat():
         if hits:
             retrieved_text = "\n".join(f"- ({h['source']}) {h['text']}" for h in hits)
 
-    # ── NEW: compact dataset summary block for the prompt ──
-    # Capped and rounded so this doesn't blow up token usage on wide datasets.
     if dataset_summary:
         numeric_preview = dict(list(dataset_summary.get("numeric_stats", {}).items())[:15])
         dataset_summary_text = (
+            f"(Original uploaded data, before cleaning)\n"
             f"Rows: {dataset_summary.get('num_rows')}  |  Columns: {dataset_summary.get('num_columns')}\n"
             f"Column names: {', '.join(dataset_summary.get('column_names', [])[:40])}\n"
-            f"Numeric columns: {', '.join(dataset_summary.get('numeric_columns', []))}\n"
-            f"Categorical columns: {', '.join(dataset_summary.get('categorical_columns', []))}\n"
             f"Duplicate rows: {dataset_summary.get('duplicate_rows')}\n"
-            f"Missing values per column: {dataset_summary.get('missing_values')}\n"
-            f"Numeric stats (min/max/mean/median/std): {numeric_preview}\n"
+            f"Missing values per column (original): {dataset_summary.get('missing_values')}\n"
+            f"Numeric stats (min/max/mean/median/std, missing excluded): {numeric_preview}\n"
         )
-        if dataset_summary.get("age_stats"):
-            dataset_summary_text += f"Age stats: {dataset_summary['age_stats']}\n"
-        if dataset_summary.get("income_stats"):
-            dataset_summary_text += f"Salary/Income stats: {dataset_summary['income_stats']}\n"
         if dataset_summary.get("target_distribution"):
             dataset_summary_text += f"Target class distribution: {dataset_summary['target_distribution']}\n"
+        if dataset_summary.get("cleaning_summary"):
+            dataset_summary_text += f"Cleaning applied: {dataset_summary['cleaning_summary']}\n"
     else:
         dataset_summary_text = "No dataset summary available for this job."
 
-    # ── NEW: model + SHAP + business summary blocks ──
     model_summary_text = (
         f"Best model: {ml_rec.get('best_model','—')}  |  Task: {ml_rec.get('task_type','—')}  |  "
-        f"Target: {ml_rec.get('target_column','—')}  |  Score: {ml_rec.get('best_score','—')}\n"
-        f"Leaderboard: {[(m.get('name'), m.get('score')) for m in ml_rec.get('models', [])]}\n"
+        f"Target: {ml_rec.get('target_column','—')}  |  Hold-out {ml_rec.get('scoring_metric','score')}: {ml_rec.get('best_score','—')}\n"
+        f"Leaderboard (hold-out score, cv score): {[(m.get('name'), m.get('score'), (m.get('metrics') or {}).get('cv_score')) for m in ml_rec.get('models', [])]}\n"
     )
-    shap_text = f"Top feature importances: {ml_rec.get('feature_importances', [])[:10]}"
+    shap_text = f"Top feature importances (computed from the trained model): {ml_rec.get('feature_importances', [])[:10]}"
     recs_text = f"Business recommendations: {ad.get('actions', [])[:8]}"
 
-    # ── UPDATED system prompt: senior-analyst framing + explicit anti-hallucination rule ──
     system_prompt = (
-        "You are DataMind AI's analytics copilot — acting as a senior data scientist, "
-        "business analyst, ML engineer, and explainability expert combined.\n\n"
+        "You are DataMind AI's analytics copilot (senior data scientist + ML engineer).\n\n"
         f"DATASET SUMMARY:\n{dataset_summary_text}\n"
         f"MODEL SUMMARY:\n{model_summary_text}\n"
-        f"{shap_text}\n"
-        f"{recs_text}\n"
-        f"RETRIEVED REPORT CONTEXT (for interpretive questions):\n{retrieved_text}\n\n"
+        f"{shap_text}\n{recs_text}\n"
+        f"RETRIEVED REPORT CONTEXT:\n{retrieved_text}\n\n"
         "Rules:\n"
-        "- If the answer is a number or fact present in DATASET SUMMARY or MODEL SUMMARY above, "
-        "answer directly and confidently — do not say you don't have the data.\n"
-        "- If the question needs interpretation (why a model was chosen, explaining SHAP, "
-        "business meaning, executive summary), use the retrieved report context.\n"
-        "- If something genuinely isn't in any of the sources above, say exactly what's missing "
-        "instead of guessing or inventing a number.\n"
-        "- Never fabricate statistics that aren't in the provided context.\n"
-        "- Keep answers concise: 2-6 sentences unless asked for a structured breakdown."
+        "- Numbers in DATASET SUMMARY / MODEL SUMMARY are computed facts; quote them exactly.\n"
+        "- Subgroup statistics (e.g. averages for a category) are NOT in this context: if asked, say you "
+        "could not compute them from this question and suggest rephrasing with a column and value.\n"
+        "- Label what you say: 'Computed' (dataset/model numbers), 'From the report' (retrieved context), "
+        "'General interpretation' (your reasoning). Feature importance is predictive association, not causation.\n"
+        "- If something is not in the sources, say exactly what is missing. Never invent numbers.\n"
+        "- Keep answers concise: 2-6 sentences unless asked for a breakdown."
     )
-
-    # Use job_id as chat key; fall back to user email so chat persists across page refreshes
-    chat_key = job_id if job_id and job_id in jobs else f"user_{(user or {}).get('email','anon')}"
-    history = _chats.setdefault(chat_key, [])
     history.append({"role": "user", "content": message})
     try:
         from agents import llmops
-        client = Groq(api_key=api_key)
+        client = Groq(api_key=api_key, timeout=float(os.environ.get("LLM_TIMEOUT_S", 30)), max_retries=1)
         with llmops.track_llm_call(job_id, user["email"], "chat") as ctx:
             comp = client.chat.completions.create(
-                model="openai/gpt-oss-120b", max_tokens=700, temperature=0.4,
+                model="openai/gpt-oss-120b", max_tokens=700, temperature=0.3,
                 messages=[{"role": "system", "content": system_prompt}] + history[-12:],
             )
             ctx["response"] = comp
         reply = comp.choices[0].message.content.strip()
         history.append({"role": "assistant", "content": reply})
-        return jsonify({"reply": reply, "chat_key": chat_key})
+        return jsonify({"reply": reply, "chat_key": chat_key, "source": "retrieved_analysis+llm"})
     except Exception as e:
+        history.pop()
         import traceback; traceback.print_exc()
-        err_str = str(e)
-        if "api_key" in err_str.lower() or "authentication" in err_str.lower():
-            return jsonify({"error": "Invalid Groq API key. Please check your key in settings."}), 401
-        if "rate" in err_str.lower():
-            return jsonify({"error": "Groq rate limit hit. Please wait a moment and try again."}), 429
-        return jsonify({"error": f"Chat error: {err_str}"}), 500
+        return _groq_error_response(e)
 
 
 
@@ -1158,10 +1271,13 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
         log(job_id, "[AG1] Data Detective loading CSV...")
 
         det = detective.run_detective(filepath)
+        if det.get("error"):
+            raise DatasetError(f"Could not read the uploaded CSV: {det['error']}")
         det["filename"] = filename
         df  = det.get("df")
-        if df is None:
-            raise ValueError("DataFrame missing from detective output")
+        if df is None or len(df) == 0 or df.shape[1] == 0:
+            raise DatasetError("The uploaded file contains no usable rows/columns.")
+        df_raw = det.get("df_raw")
 
         log(job_id, f"[AG1] {det['original_shape'][0]} rows, {det['original_shape'][1]} cols, quality {det.get('quality_score',0)}%")
 
@@ -1170,6 +1286,11 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
             df.to_csv(cleaned_path, index=False)
         except Exception:
             cleaned_path = filepath
+        try:
+            data_store.update(app.config["UPLOAD_FOLDER"], job_id, cleaned_path=cleaned_path,
+                              rows=int(len(df)), cols=int(df.shape[1]))
+        except Exception:
+            pass
 
         set_step(job_id, 2, "Finding AI insights")
         log(job_id, "[AG2] Sending request to Groq GPT-OSS 120B...")
@@ -1185,7 +1306,12 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
 
         ml   = ml_engineer.run_ml_engineer(df, det, ana, mode_override=("" if mode == "auto" else mode))
         best = next((m for m in ml.get("models", []) if m.get("is_best")), None)
-        log(job_id, f"[AG3] Best: {best['name'] if best else 'N/A'} @ {round((best.get('score',0) if best else 0)*100,1)}%")
+        det.pop("df_raw", None)   # raw copy no longer needed inside det; kept in local `df_raw`
+        for w in ml.get("evaluation_warnings", []) or []:
+            log(job_id, f"[AG3][WARN] {w}")
+        if ml.get("error") and not ml.get("models"):
+            log(job_id, f"[AG3][WARN] Model training skipped: {ml['error']}")
+        log(job_id, f"[AG3] Best: {best['name'] if best else 'N/A'} @ {round((best.get('score',0) if best else 0)*100,1)}% (hold-out {ml.get('score_metric','score')})")
         if ml.get("future_prediction", {}).get("future_y"):
             log(job_id, f"[AG3] Future prediction: {ml['future_prediction']['future_steps']} steps ahead")
 
@@ -1290,10 +1416,20 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
 
         # ── NEW: build dataset summary once, store alongside other job results ──
         try:
-            dataset_summary = build_dataset_summary(df, ctx_safe, ml_rec)
+            dataset_summary = build_dataset_summary(df_raw if df_raw is not None else df, ctx_safe, ml_rec, df_clean=df)
         except Exception as ds_err:
             log(job_id, f"[WARN] Dataset summary skipped: {ds_err}")
             dataset_summary = {}
+
+        # Deterministic cross-checks: dashboard/chat/report numbers must agree with the source data.
+        try:
+            extra_flags = evaluator.run_consistency_checks(rep, ctx_safe, ml_safe, dataset_summary)
+            eval_result = evaluator.merge_flags(eval_result, extra_flags)
+            for f in extra_flags:
+                log(job_id, f"[AG4b][{f['severity'].upper()}] {f['check']}: {f['message']}")
+        except Exception as cons_err:
+            log(job_id, f"[WARN] Consistency checks skipped: {cons_err}")
+        df_raw = None   # release memory; chat reloads it from the data store on demand
 
         # Ensure distribution_data is populated from multiple sources
         dist_data = (
@@ -1327,6 +1463,27 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
                 "quality_score":  float(det.get("quality_score", 0)),
                 "insights_count": len(ana.get("key_insights", [])),
                 "missing_fixed":  ctx_safe.get("missing_values_fixed", {}),
+                "missing_original": ctx_safe.get("missing_original", {}),
+            },
+            "data_quality": {
+                "original": {
+                    "rows": int(det["original_shape"][0]), "columns": int(det["original_shape"][1]),
+                    "missing_total": int(ctx_safe.get("missing_before", 0)),
+                    "missing_per_column": ctx_safe.get("missing_original", {}),
+                    "duplicate_rows": ctx_safe.get("duplicate_rows_original", 0),
+                    "column_completeness_pct": ctx_safe.get("column_completeness", {}),
+                },
+                "cleaned": {
+                    "missing_total": int(ctx_safe.get("missing_after", 0)),
+                    "rows_removed": (ctx_safe.get("cleaning_summary") or {}).get("rows_removed", 0),
+                    "cells_imputed": (ctx_safe.get("cleaning_summary") or {}).get("cells_imputed", 0),
+                },
+                "transformations": (ctx_safe.get("cleaning_summary") or {}).get("strategy", ""),
+                "flags": {
+                    "constant_columns": ctx_safe.get("constant_columns", []),
+                    "identifier_columns": ctx_safe.get("identifier_columns", []),
+                    "high_cardinality_columns": ctx_safe.get("high_cardinality_columns", []),
+                },
             },
             "quality_dimensions": ctx_safe.get("quality_dimensions", {}),
             "risk_flags": rep.get("risk_flags", []),
@@ -1405,6 +1562,14 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
         import traceback; traceback.print_exc()
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"]  = str(e)
+        _es = str(e).lower()
+        jobs[job_id]["error_type"] = (
+            "invalid_dataset" if isinstance(e, DatasetError) else
+            "timeout" if "timeout" in _es or "timed out" in _es else
+            "llm_error" if ("groq" in _es or "api key" in _es or "rate limit" in _es) else
+            "model_training_error" if jobs[job_id].get("step") == 3 else
+            "pipeline_error"
+        )
         history = jobs[job_id].get("step_history", [])
         if history and history[-1]["ended_at"] is None:
             history[-1]["ended_at"] = time.time()
