@@ -205,6 +205,27 @@ def run_detective(filepath: str) -> dict:
     original_shape = df.shape
     missing_before = int(df.isnull().sum().sum())
 
+    # ── Snapshot ORIGINAL data quality before any cleaning ───────
+    # Cleaning below imputes in place; everything reported to users as
+    # "original" quality (dashboard, chat, PDF) must come from this snapshot.
+    df_raw = df.copy()
+    missing_original = {str(c): int(df[c].isnull().sum()) for c in df.columns}
+    duplicate_rows_original = int(df.duplicated().sum())
+    dtypes_original = {str(c): str(df[c].dtype) for c in df.columns}
+    n_rows_orig = max(len(df), 1)
+    constant_columns = [str(c) for c in df.columns if df[c].nunique(dropna=True) <= 1]
+    identifier_columns = [
+        str(c) for c in df.columns
+        if len(df) > 20 and df[c].nunique(dropna=True) == df[c].notna().sum() and
+        (df[c].dtype == object or pd.api.types.is_integer_dtype(df[c]))
+        and df[c].notna().sum() > 0.95 * len(df)
+    ]
+    high_cardinality_columns = [
+        str(c) for c in df.columns
+        if df[c].dtype == object and len(df) > 20 and
+        0.5 < df[c].nunique(dropna=True) / n_rows_orig < 1.0 and str(c) not in identifier_columns
+    ]
+
     # ── Detect & parse date columns ──────────────────────────────
     date_cols = []
     for col in df.columns:
@@ -237,6 +258,16 @@ def run_detective(filepath: str) -> dict:
             missing_values_fixed[col] = n
 
     missing_after = int(df.isnull().sum().sum())
+    cleaning_summary = {
+        "rows_removed": 0,
+        "rows_changed": int((df_raw.isnull().any(axis=1)).sum()),
+        "cells_imputed": int(sum(missing_values_fixed.values())),
+        "imputed_columns": dict(missing_values_fixed),
+        "strategy": "numeric: median; categorical: most frequent value (or 'Unknown')",
+        "missing_before": missing_before,
+        "missing_after": missing_after,
+        "note": "Source file is unchanged; original missing-value counts are preserved in missing_original.",
+    }
 
     # ── Quality score ────────────────────────────────────────────
     completeness = 1 - (missing_before / max(original_shape[0] * original_shape[1], 1))
@@ -256,7 +287,7 @@ def run_detective(filepath: str) -> dict:
             "std": round(float(s.std()), 4),
             "min": round(float(s.min()), 4),
             "max": round(float(s.max()), 4),
-            "missing": missing_values_fixed.get(col, 0),
+            "missing": missing_original.get(str(col), 0),
             "unique": int(s.nunique()),
             "outlier_count": outs["count"],
             "outlier_pct": outs["pct"],
@@ -268,7 +299,7 @@ def run_detective(filepath: str) -> dict:
             "type": "categorical",
             "unique": int(s.nunique()),
             "top": str(s.mode()[0]) if not s.mode().empty else "",
-            "missing": missing_values_fixed.get(col, 0),
+            "missing": missing_original.get(str(col), 0),
             "top_values": [{"value": str(k), "count": int(v)} for k, v in vc.items()],
         }
 
@@ -308,9 +339,9 @@ def run_detective(filepath: str) -> dict:
     # ── Column completeness (per-column quality) ─────────────────
     total_rows = original_shape[0]
     column_completeness = {
-        col: round((1 - df[col].isnull().sum() / max(total_rows, 1)) * 100, 1)
+        col: round((1 - missing_original.get(str(col), 0) / max(total_rows, 1)) * 100, 1)
         for col in df.columns
-    }
+    }   # ORIGINAL completeness — a column imputed during cleaning is not 'complete'
 
     # ── Top correlations (pairs) ─────────────────────────────────
     top_correlations = []
@@ -334,6 +365,14 @@ def run_detective(filepath: str) -> dict:
 
     return {
         "df": df,
+        "df_raw": df_raw,
+        "missing_original": missing_original,
+        "duplicate_rows_original": duplicate_rows_original,
+        "dtypes_original": dtypes_original,
+        "constant_columns": constant_columns,
+        "identifier_columns": identifier_columns,
+        "high_cardinality_columns": high_cardinality_columns,
+        "cleaning_summary": cleaning_summary,
         "original_shape": list(original_shape),
         "numeric_cols": numeric_cols,
         "categorical_cols": categorical_cols,
