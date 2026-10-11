@@ -233,7 +233,7 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
         from groq import Groq
         from agents import llmops
 
-        client   = Groq(api_key=api_key)
+        client   = Groq(api_key=api_key, timeout=45.0, max_retries=1)
         with llmops.track_llm_call(job_id, user_email, "reporter") as ctx:
             response = client.chat.completions.create(
                 model="llama-3.3-70b-versatile",
