@@ -98,6 +98,121 @@ def _check_small_sample(rows: int) -> list[dict]:
     return []
 
 
+# ─────────────────────────────────────────────────────────────────
+# Numerical-consistency checks (deterministic — no LLM involved)
+# ─────────────────────────────────────────────────────────────────
+import re as _re
+
+
+def _flag(check: str, message: str, severity: str = "fail") -> dict:
+    return {"check": check, "severity": severity, "message": message}
+
+
+def _check_missing_consistency(det: dict, dataset_summary: dict) -> list[dict]:
+    flags = []
+    orig = det.get("missing_original")
+    if not orig or not dataset_summary:
+        return flags
+    chat_side = dataset_summary.get("missing_values") or {}
+    for col, n in orig.items():
+        if col in chat_side and int(chat_side[col]) != int(n):
+            flags.append(_flag("missing_value_consistency",
+                               f"Missing count for '{col}' differs: profiling={n}, chat summary={chat_side[col]}."))
+    total_orig = sum(int(v) for v in orig.values())
+    if det.get("missing_before") is not None and int(det["missing_before"]) != total_orig:
+        flags.append(_flag("missing_value_consistency",
+                           f"Total missing before cleaning ({det['missing_before']}) != sum of per-column counts ({total_orig})."))
+    for col, comp in (det.get("column_completeness") or {}).items():
+        rows = max((det.get("original_shape") or [0])[0], 1)
+        expected = round((1 - int(orig.get(col, 0)) / rows) * 100, 1)
+        if abs(float(comp) - expected) > 0.11:
+            flags.append(_flag("completeness_consistency",
+                               f"Column '{col}' completeness {comp}% disagrees with original missing count ({expected}% expected)."))
+    return flags
+
+
+def _check_model_consistency(ml: dict, rep: dict) -> list[dict]:
+    flags = []
+    models = [m for m in (ml.get("models") or []) if not m.get("error")]
+    if not models:
+        return flags
+    metric = ml.get("score_metric") or ("accuracy" if ml.get("task_type") == "classification" else "r2")
+    best = [m for m in models if m.get("is_best")]
+    if len(best) != 1:
+        return [_flag("model_consistency", f"Expected exactly one best model, found {len(best)}.")]
+    b = best[0]
+    if ml.get("best_model") and ml["best_model"] != b.get("name"):
+        flags.append(_flag("model_consistency", f"Reported best model '{ml['best_model']}' != flagged best '{b.get('name')}'."))
+    hold = (b.get("metrics") or {}).get(metric)
+    if hold is not None:
+        if abs(float(b.get("score", 0)) - float(hold)) > 1e-3:
+            flags.append(_flag("metric_consistency",
+                               f"Comparison score {b.get('score')} != detailed {metric} {hold} for {b.get('name')} (different evaluation protocols)."))
+        if abs(float(ml.get("best_score", 0) or 0) - float(hold)) > 1e-3:
+            flags.append(_flag("metric_consistency", f"best_score {ml.get('best_score')} != detailed {metric} {hold}."))
+    cm = (b.get("metrics") or {}).get("confusion_matrix")
+    if cm and ml.get("task_type") == "classification":
+        total = sum(sum(r) for r in cm)
+        n_test = (b.get("metrics") or {}).get("n_test")
+        if n_test and total != n_test:
+            flags.append(_flag("confusion_matrix_consistency", f"Confusion matrix sums to {total} but test size is {n_test}."))
+        if total:
+            acc = sum(cm[i][i] for i in range(len(cm))) / total
+            if hold is not None and abs(acc - float(hold)) > 1e-3:
+                flags.append(_flag("confusion_matrix_consistency",
+                                   f"Confusion-matrix accuracy {acc:.4f} != reported accuracy {hold}."))
+    # Percent claims about accuracy in the Reporter's prose must match a real stored score.
+    text = " ".join(str(rep.get(k, "")) for k in ("report", "headline", "score_meaning"))
+    allowed = []
+    for m in models:
+        for v in ((m.get("metrics") or {}).get(metric), (m.get("metrics") or {}).get("cv_score"), m.get("score")):
+            if v is not None:
+                allowed.append(float(v) * 100 if abs(float(v)) <= 1 else float(v))
+    for m in _re.finditer(r"(\d{1,3}(?:\.\d+)?)\s*%\s*(?:accuracy|accurate)|accuracy[^.\d]{0,25}(\d{1,3}(?:\.\d+)?)\s*%", text, _re.I):
+        val = float(m.group(1) or m.group(2))
+        if allowed and not any(abs(val - a) <= 0.6 for a in allowed):
+            flags.append(_flag("report_vs_metrics", f"Report text claims {val}% accuracy, which matches no stored evaluation result.", "flag"))
+    return flags
+
+
+def _check_summary_consistency(dataset_summary: dict) -> list[dict]:
+    flags = []
+    if not dataset_summary:
+        return flags
+    dist = dataset_summary.get("target_distribution")
+    tgt = dataset_summary.get("target_column")
+    if dist and tgt:
+        expected = dataset_summary.get("num_rows", 0) - int((dataset_summary.get("missing_values") or {}).get(tgt, 0))
+        if sum(int(v) for v in dist.values()) != expected:
+            flags.append(_flag("group_count_consistency",
+                               f"Target class counts sum to {sum(dist.values())}, expected {expected} (rows with a non-missing target)."))
+    return flags
+
+
+def run_consistency_checks(rep: dict, det: dict, ml: dict, dataset_summary: dict | None = None) -> list[dict]:
+    flags = []
+    flags += _check_missing_consistency(det, dataset_summary or {})
+    flags += _check_model_consistency(ml, rep)
+    flags += _check_summary_consistency(dataset_summary or {})
+    return flags
+
+
+def merge_flags(eval_result: dict, extra_flags: list[dict]) -> dict:
+    """Merge extra flags and recompute status. FAILED if any flag is a 'fail', never PASSED with flags."""
+    flags = list(eval_result.get("flags", [])) + list(extra_flags)
+    if any(f["severity"] == "fail" for f in flags):
+        status = "FAILED"
+    elif flags:
+        status = "FLAGGED"
+    else:
+        status = eval_result.get("status", "PASSED") if eval_result.get("status") != "NOT_EVALUATED" else "PASSED"
+    out = dict(eval_result)
+    out.update({"status": status, "flags": flags,
+                "checked_fields": list(dict.fromkeys(list(eval_result.get("checked_fields", [])) +
+                                                     ["missing_values", "model_metrics", "confusion_matrix", "group_counts"]))})
+    return out
+
+
 def run_evaluator(rep: dict, det: dict, ml: dict) -> dict:
     """Entry point: called from run_pipeline() right after Reporter finishes."""
     quality    = det.get("quality_score", 0) or 0
