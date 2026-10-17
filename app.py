@@ -619,8 +619,9 @@ def analyze():
     if "file" not in request.files:
         return jsonify({"error": "No file uploaded"}), 400
     file = request.files["file"]
-    if not file.filename or not file.filename.lower().endswith(".csv"):
-        return jsonify({"error": "Only CSV files supported"}), 400
+    from agents.io_utils import TABLE_EXTENSIONS
+    if not file.filename or not file.filename.lower().endswith(TABLE_EXTENSIONS):
+        return jsonify({"error": "Unsupported file type. Upload a .csv, .tsv, .txt, .xlsx or .xls file."}), 400
 
     query         = request.form.get("query", "Give me key insights about this data.")
     api_key       = request.form.get("api_key", "").strip() or GROQ_API_KEY
@@ -737,7 +738,7 @@ def download_report(job_id):
         if not pdf_bytes or len(pdf_bytes) < 100:
             return jsonify({"error": "PDF empty"}), 500
         buf = io.BytesIO(pdf_bytes); buf.seek(0)
-        safe = job.get("filename", "report").replace(".csv", "")
+        safe = os.path.splitext(job.get("filename", "report"))[0]
         return send_file(buf, mimetype="application/pdf", as_attachment=True,
                          download_name=f"DataMind_Report_{safe}.pdf")
     except Exception as e:
@@ -933,11 +934,19 @@ def _collect_numbers(obj, out: set):
                 pass
 
 
-def _llm_numbers_ok(llm_text: str, computed: dict) -> bool:
-    """True only if every number the LLM wrote traces back to a computed value (tolerance for rounding)."""
+_EXPLAIN_HINT = re.compile(
+    r"\b(why|explain\w*|drive[sn]?|drivers?|reasons?|cause[sd]?|because|recommend\w*|what should|insights?|interpret\w*|"
+    r"important|importance|means?)\b", re.IGNORECASE)
+
+
+def _llm_numbers_ok(llm_text: str, computed: dict, extra_text: str = "") -> bool:
+    """True only if every number the LLM wrote traces back to a computed value (tolerance for rounding).
+    extra_text: retrieved report context shown to the LLM for hybrid questions (its numbers are also allowed)."""
     allowed: set = set()
     _collect_numbers(computed.get("values"), allowed)
     _collect_numbers(computed.get("filters"), allowed)
+    if extra_text:
+        _collect_numbers(extra_text, allowed)
     for m in _NUM_RE.findall(llm_text):
         try:
             v = float(m.replace(",", ""))
@@ -957,9 +966,10 @@ def _groq_error_response(e: Exception):
         return jsonify({"error": "The AI service timed out. Please try again.", "error_type": "timeout"}), 504
     if "api_key" in err_str or "authentication" in err_str or "invalid api key" in err_str:
         return jsonify({"error": "Invalid Groq API key. Please check your key in settings.", "error_type": "llm_auth"}), 401
-    if "rate" in err_str:
+    if getattr(e, "status_code", None) == 429 or "ratelimit" in name or "rate limit" in err_str or "rate_limit" in err_str:
         return jsonify({"error": "Groq rate limit hit. Please wait a moment and try again.", "error_type": "llm_rate_limit"}), 429
-    return jsonify({"error": f"Chat error: {e}", "error_type": "llm_error"}), 500
+    logger.warning("Chat LLM error: %s: %s", type(e).__name__, e)   # detail stays in server logs, not in the response
+    return jsonify({"error": "The AI service could not complete this request. Please try again.", "error_type": "llm_error"}), 500
 
 
 @app.route("/api/chat", methods=["POST"])
@@ -1033,6 +1043,12 @@ def chat():
                 from groq import Groq
                 from agents import llmops
                 evidence = query_engine.evidence_for_llm(computed)
+                # Hybrid question ("how many survived and why?"): numbers stay deterministic; retrieved report
+                # context is added ONLY to support the explanation, never as a source of calculations.
+                rag_ctx = ""
+                if _EXPLAIN_HINT.search(message) and job.get("rag_index") is not None:
+                    rag_hits = job["rag_index"].retrieve(message, k=4)
+                    rag_ctx = "\n".join(f"- ({h['source']}) {h['text']}" for h in rag_hits)
                 sys_p = (
                     "You are DataMind AI's analytics copilot. COMPUTED EVIDENCE below was calculated "
                     "deterministically from the user's actual dataset and is the ONLY source of numbers.\n"
@@ -1041,6 +1057,7 @@ def chat():
                     "never change, recompute, round differently, or add any number that is not in the evidence; "
                     "do not claim causation; state limitations (e.g. missing values excluded) if listed; "
                     "this is a general interpretation, not a new calculation."
+                    + (f"\n\nREPORT CONTEXT (use only to explain; never to calculate or to change the numbers above):\n{rag_ctx}" if rag_ctx else "")
                 )
                 client = Groq(api_key=api_key, timeout=float(os.environ.get("LLM_TIMEOUT_S", 30)), max_retries=1)
                 with llmops.track_llm_call(job_id, user["email"], "chat") as ctx:
@@ -1050,9 +1067,9 @@ def chat():
                     )
                     ctx["response"] = comp
                 note = (comp.choices[0].message.content or "").strip()
-                if note and _llm_numbers_ok(note, computed):
+                if note and _llm_numbers_ok(note, computed, rag_ctx):
                     reply += "\n\n**Interpretation (AI, general):** " + note
-                    return _finish(reply, "computed+llm", {"computed": comp_payload})
+                    return _finish(reply, "computed+rag+llm" if rag_ctx else "computed+llm", {"computed": comp_payload})
                 reply += "\n\n_(AI interpretation withheld: it contained numbers not present in the computed results.)_"
             except Exception as e:
                 logger.warning("Chat explanation skipped: %s", e)
@@ -1274,6 +1291,8 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
         if det.get("error"):
             raise DatasetError(f"Could not read the uploaded CSV: {det['error']}")
         det["filename"] = filename
+        for _note in det.get("io_notes") or []:
+            log(job_id, f"[AG1] File note: {_note}")   # conversions the reader applied are never silent
         df  = det.get("df")
         if df is None or len(df) == 0 or df.shape[1] == 0:
             raise DatasetError("The uploaded file contains no usable rows/columns.")
@@ -1281,7 +1300,7 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
 
         log(job_id, f"[AG1] {det['original_shape'][0]} rows, {det['original_shape'][1]} cols, quality {det.get('quality_score',0)}%")
 
-        cleaned_path = filepath.replace(".csv", "_cleaned.csv")
+        cleaned_path = os.path.splitext(filepath)[0] + "_cleaned.csv"   # never overwrite the original upload
         try:
             df.to_csv(cleaned_path, index=False)
         except Exception:
@@ -1423,7 +1442,7 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
 
         # Deterministic cross-checks: dashboard/chat/report numbers must agree with the source data.
         try:
-            extra_flags = evaluator.run_consistency_checks(rep, ctx_safe, ml_safe, dataset_summary)
+            extra_flags = evaluator.run_consistency_checks(rep, ctx_safe, ml_safe, dataset_summary, requested_target=target_column)
             eval_result = evaluator.merge_flags(eval_result, extra_flags)
             for f in extra_flags:
                 log(job_id, f"[AG4b][{f['severity'].upper()}] {f['check']}: {f['message']}")
