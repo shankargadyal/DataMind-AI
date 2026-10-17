@@ -108,7 +108,8 @@ def get_dataframe(folder: str, job_id: str, user_email: str, kind: str = "raw"):
             _cache.move_to_end(key)
             return _cache[key], None
     try:
-        df = pd.read_csv(path, low_memory=False)
+        from agents.io_utils import read_table
+        df = read_table(path)
     except Exception:
         return None, "dataset_unreadable"
     with _lock:
