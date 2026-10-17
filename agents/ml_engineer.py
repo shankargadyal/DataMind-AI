@@ -171,7 +171,7 @@ def _get_models(task_type: str):
             )))
         if HAS_CATBOOST:
             models.append(("CatBoost", CatBoostClassifier(
-                iterations=100, random_state=42, verbose=False
+                iterations=100, random_state=42, verbose=False, allow_writing_files=False
             )))
     else:
         models = [
@@ -189,7 +189,7 @@ def _get_models(task_type: str):
             )))
         if HAS_CATBOOST:
             models.append(("CatBoost Regressor", CatBoostRegressor(
-                iterations=100, random_state=42, verbose=False
+                iterations=100, random_state=42, verbose=False, allow_writing_files=False
             )))
     return models
 
@@ -214,24 +214,45 @@ def _safe_cv(model, X_train, y_train, scoring: str, task_type: str):
         return None, None, 0, f"cross-validation failed: {type(e).__name__}"
 
 
+def _safe_cv_classification(model, X_train, y_train):
+    """One cross-validation pass that returns BOTH accuracy and macro-F1 (same folds as _safe_cv, no extra fits).
+    Returns (acc_mean, acc_std, f1_macro_mean, folds, note); Nones when CV is not statistically valid."""
+    from sklearn.base import clone
+    from sklearn.model_selection import cross_validate
+    _, counts = np.unique(y_train, return_counts=True)
+    folds = int(min(3, counts.min())) if len(counts) else 0
+    if folds < 2:
+        return None, None, None, 0, "cross-validation skipped: smallest class in the training split has < 2 members"
+    try:
+        cv = cross_validate(clone(model), X_train, y_train, cv=folds, scoring={"acc": "accuracy", "f1m": "f1_macro"})
+        return (round(float(cv["test_acc"].mean()), 4), round(float(cv["test_acc"].std()), 4),
+                round(float(cv["test_f1m"].mean()), 4), folds, "")
+    except Exception as e:
+        return None, None, None, 0, f"cross-validation failed: {type(e).__name__}"
+
+
 def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type: str, n_classes: int = 0) -> dict:
     y_pred = model.predict(X_test)
     if task_type == "classification":
         avg = "weighted"
         labels = list(range(n_classes)) if n_classes else None
         cm = confusion_matrix(y_test, y_pred, labels=labels).tolist()
-        cv_mean, cv_std, folds, cv_note = _safe_cv(model, X_train, y_train, "accuracy", task_type)
+        cv_mean, cv_std, cv_f1_macro, folds, cv_note = _safe_cv_classification(model, X_train, y_train)
         return {
             "accuracy":          round(float(accuracy_score(y_test, y_pred)), 4),
             "precision":         round(float(precision_score(y_test, y_pred, average=avg, zero_division=0)), 4),
             "recall":            round(float(recall_score(y_test, y_pred, average=avg, zero_division=0)), 4),
             "f1":                round(float(f1_score(y_test, y_pred, average=avg, zero_division=0)), 4),
+            "f1_macro":          round(float(f1_score(y_test, y_pred, average="macro", zero_division=0)), 4),
             "confusion_matrix":  cm,
             "cv_score":          cv_mean,
             "cv_std":            cv_std,
+            "cv_f1_macro":       cv_f1_macro,
             "cv_folds":          folds,
             "cv_note":           cv_note,
             "n_test":            int(len(y_test)),
+            # precision/recall/f1 above are weighted by class size; f1_macro counts every class equally
+            "averaging":         "precision/recall/f1 = weighted by class size; f1_macro = unweighted mean over classes",
         }
     rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
     cv_mean, cv_std, folds, cv_note = _safe_cv(model, X_train, y_train, "r2", task_type)
@@ -275,10 +296,42 @@ def _plan_split(y, task_type: str, test_size: float) -> dict:
 
 # ── SHAP / feature importance ───────────────────────────────────────────────
 
-def _get_feature_importance(model, X_sample: np.ndarray, feature_cols: list) -> list:
+def _shap_unsafe(model) -> bool:
+    """CatBoost multiclass + shap.Explainer corrupts the heap (native abort that try/except cannot catch and
+    that would kill the whole worker). Use the model's own feature_importances_ for it instead."""
+    return type(model).__name__.startswith("CatBoost") and len(getattr(model, "classes_", [])) > 2
+
+
+MACRO_SELECTION_RATIO = 0.7        # choose models by macro-F1 when smallest/largest class ratio is below this
+PERMUTATION_MAX_FEATURES = 80      # work cap: n_features x repeats x predict(rows) must stay cheap for slow predictors (KNN)
+
+
+def _permutation_importance_fallback(model, X_eval, y_eval, feature_cols, scoring) -> list:
+    """Model-agnostic importance for models with no gini/coef/SHAP (e.g. KNN): how much the HOLD-OUT score drops
+    when one feature's values are shuffled. Uses a small fixed sample and seed (reproducible, bounded cost)."""
+    if X_eval is None or y_eval is None or len(feature_cols) == 0:
+        return []
+    X_eval = np.asarray(X_eval)
+    if X_eval.ndim != 2 or X_eval.shape[1] != len(feature_cols) or X_eval.shape[1] > PERMUTATION_MAX_FEATURES:
+        return []
+    try:
+        from sklearn.inspection import permutation_importance
+        n = min(300, len(y_eval))
+        res = permutation_importance(model, X_eval[:n], np.asarray(y_eval)[:n], scoring=scoring,
+                                     n_repeats=3, random_state=42, n_jobs=1)
+        out = [{"feature": c, "importance": round(float(max(m, 0.0)), 6), "method": "permutation"}
+               for c, m in zip(feature_cols, res.importances_mean)]
+        out.sort(key=lambda x: x["importance"], reverse=True)
+        return out[:15] if any(o["importance"] > 0 for o in out) else []
+    except Exception:
+        return []
+
+
+def _get_feature_importance(model, X_sample: np.ndarray, feature_cols: list,
+                            X_eval=None, y_eval=None, scoring=None) -> list:
     importances = []
 
-    if HAS_SHAP:
+    if HAS_SHAP and not _shap_unsafe(model):
         try:
             explainer   = shap.Explainer(model, X_sample[:100])
             shap_values = explainer(X_sample[:100])
@@ -309,6 +362,9 @@ def _get_feature_importance(model, X_sample: np.ndarray, feature_cols: list) -> 
         importances.sort(key=lambda x: x["importance"], reverse=True)
         return importances[:15]
 
+    perm = _permutation_importance_fallback(model, X_eval, y_eval, feature_cols, scoring)
+    if perm:
+        return perm
     return []   # no honest importance available for this model type — never fabricate scores
 
 
@@ -471,6 +527,18 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
     if task_type == "classification":
         le_target = LabelEncoder()
         y = le_target.fit_transform(pd.Series(y_raw).astype(str).values)
+        # Feature engineering label-encodes text targets, so le_target only knows "0","1",... here.
+        # Restore the ORIGINAL class names for display (codes/y are untouched), so confusion matrices
+        # and per-class output say "Churned"/"Retained" instead of "0"/"1".
+        try:
+            if target_col in df.columns and len(df) == len(df_feat) and not pd.api.types.is_numeric_dtype(df[target_col]):
+                pair = pd.DataFrame({"code": pd.Series(y_raw).astype(str).values,
+                                     "name": pd.Series(df[target_col].values[row_ok]).astype(str).values}).drop_duplicates()
+                if pair["code"].is_unique and pair["name"].is_unique:
+                    names = dict(zip(pair["code"], pair["name"]))
+                    le_target.classes_ = np.array([names[c] for c in le_target.classes_], dtype=object)
+        except Exception:
+            pass   # display-only nicety; never break training
     else:
         y = y_raw.astype(float)
 
@@ -514,6 +582,32 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
         eval_warnings.append(f"Stratified split failed ({e}); a plain random split was used.")
         X_train_raw, X_test_raw, y_train, y_test = train_test_split(X, y, **split_kwargs)
 
+    # Speed cap: RandomForest / GradientBoosting (and their k-fold CV) scale super-linearly, so on very large
+    # data (100k rows took >4.5 min) model *selection* runs on a sample of the TRAINING split only. The hold-out
+    # test set is untouched, and all rows are still used for profiling, analysis and chat calculations.
+    max_train = max(1000, int(os.environ.get("DATAMIND_MAX_TRAIN_ROWS", "20000")))
+    train_rows_before_cap = int(len(y_train))
+    train_cap_note = None
+    if train_rows_before_cap > max_train:
+        if det.get("is_timeseries") and task_type == "regression":
+            X_train_raw, y_train = X_train_raw[-max_train:], y_train[-max_train:]      # keep the most recent rows
+            how = "the most recent"
+        else:
+            sub = {"train_size": max_train, "random_state": 42}
+            if split_kwargs.get("stratify") is not None:
+                sub["stratify"] = y_train
+            try:
+                X_train_raw, _, y_train, _ = train_test_split(X_train_raw, y_train, **sub)
+                how = "a stratified random" if "stratify" in sub else "a random"
+            except ValueError:
+                sub.pop("stratify", None)
+                X_train_raw, _, y_train, _ = train_test_split(X_train_raw, y_train, **sub)
+                how = "a random"
+        train_cap_note = (f"Large dataset: models were fitted and cross-validated on {how} sample of {max_train:,} of the "
+                          f"{train_rows_before_cap:,} training rows to keep runtime reasonable. The hold-out test set "
+                          f"({len(y_test):,} rows) is untouched; profiling, analysis and chat calculations use all rows.")
+        eval_warnings.append(train_cap_note)
+
     # Fit the scaler on the TRAINING split only (no test-set leakage).
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train_raw)
@@ -522,13 +616,26 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
     poly_feature_cols = feature_cols[:]
 
     primary_metric = "accuracy" if task_type == "classification" else "r2"
+    # On imbalanced classes, "highest accuracy" is won by a model that only predicts the majority class.
+    # Select by cross-validated MACRO-F1 there (every class counts equally); the reported score stays accuracy.
+    # "Clearly not balanced" = smallest class < 70% the size of the largest (churn at 27/73 qualifies; the
+    # separate `imbalanced` warning flag keeps its stricter < 30% threshold).
+    _ratio = imbalance.get("ratio", 1.0) if task_type == "classification" else 1.0
+    use_macro_selection = task_type == "classification" and _ratio < MACRO_SELECTION_RATIO
+    if use_macro_selection:
+        eval_warnings.append(f"Classes are unevenly sized (smallest/largest = {_ratio:.2f}): the best model was chosen by "
+                             f"cross-validated macro F1 (every class counts equally) instead of accuracy, so predicting only "
+                             f"the majority class cannot win by default.")
     evaluation_protocol = {
         "split": "hold-out test set",
         "n_train": int(len(y_train)), "n_test": int(len(y_test)),
+        "n_train_before_cap": train_rows_before_cap, "train_sample_cap": max_train if train_cap_note else None,
         "stratified": bool(split_kwargs.get("stratify") is not None),
         "random_state": 42,
         "reported_metric": primary_metric,
-        "selection_rule": "highest cross-validated score on the training split (falls back to hold-out score if CV is not valid)",
+        "selection_rule": ("highest cross-validated macro F1 on the training split (imbalanced classes; falls back to hold-out macro F1 if CV is not valid)"
+                           if use_macro_selection else
+                           "highest cross-validated score on the training split (falls back to hold-out score if CV is not valid)"),
     }
 
     model_results, best_model_obj, best_sel, best_name = [], None, -np.inf, ""
@@ -538,7 +645,11 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
             metrics = _eval_metrics(clf, X_train, X_test, y_train, y_test, task_type, n_classes)
             holdout = metrics.get(primary_metric)
             cvm = metrics.get("cv_score")
-            sel = cvm if cvm is not None else holdout
+            if use_macro_selection:
+                cvf = metrics.get("cv_f1_macro")
+                sel = cvf if cvf is not None else metrics.get("f1_macro")
+            else:
+                sel = cvm if cvm is not None else holdout
             # "score" is ALWAYS the hold-out metric so comparison table == detailed metrics.
             model_results.append({
                 "name": name, "score": round(float(holdout), 4), "score_metric": primary_metric,
@@ -555,9 +666,18 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
     best_entry = next((m for m in model_results if m["is_best"]), None)
     best_score = float(best_entry["score"]) if best_entry else 0.0
 
+    # Weighted metrics hide poor minority-class results; say so when the gap is large (informational, not a hold).
+    if best_entry and task_type == "classification":
+        bm_ = best_entry.get("metrics") or {}
+        if bm_.get("f1") is not None and bm_.get("f1_macro") is not None and bm_["f1"] - bm_["f1_macro"] >= 0.2:
+            eval_warnings.append(f"Weighted F1 ({bm_['f1']:.0%}) is much higher than macro F1 ({bm_['f1_macro']:.0%}): "
+                                 f"the model predicts the larger classes well but the smaller classes poorly.")
+
     feature_importances = []
     if best_model_obj is not None:
-        feature_importances = _get_feature_importance(best_model_obj, X_scaled[:200], poly_feature_cols)
+        _imp_scoring = ("f1_macro" if use_macro_selection else "accuracy") if task_type == "classification" else "r2"
+        feature_importances = _get_feature_importance(best_model_obj, X_scaled[:200], poly_feature_cols,
+                                                      X_eval=X_test, y_eval=y_test, scoring=_imp_scoring)
 
     shap_plots = {"available": False, "reason": "not computed"}
     if best_model_obj is not None:
@@ -589,7 +709,7 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
         "score_metric":         primary_metric,
         "evaluation_protocol":  evaluation_protocol,
         "evaluation_warnings":  eval_warnings,
-        "selection_metric":     "cv_score",
+        "selection_metric":     "cv_f1_macro" if use_macro_selection else "cv_score",
         # Private objects
         "_model_obj":    best_model_obj,
         "_scaler_obj":   scaler,
