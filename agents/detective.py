@@ -22,6 +22,29 @@ def _is_date_col(series: pd.Series) -> bool:
     return False
 
 
+def _parse_dates(series: pd.Series) -> tuple[pd.Series, str | None]:
+    """Parse a date column without silently losing rows. pandas fixes the format from the FIRST value and turns
+    every differently-formatted value into NaT; if that happens and mixed-format parsing recovers them, use it."""
+    default = pd.to_datetime(series, errors="coerce")
+    lost = int(default.isna().sum() - series.isna().sum())
+    if lost <= 0:
+        return default, None
+    try:
+        mixed = pd.to_datetime(series, errors="coerce", format="mixed")
+    except Exception:
+        return default, f"{lost} date value(s) could not be parsed and are treated as missing."
+    recovered = lost - int(mixed.isna().sum() - series.isna().sum())
+    if recovered <= 0:
+        return default, f"{lost} date value(s) could not be parsed and are treated as missing."
+    vals = series.dropna().astype(str)
+    both_small = vals.str.extract(r"^(\d{1,2})/(\d{1,2})/\d{4}")
+    ambiguous = bool(both_small.dropna().astype(int).le(12).all(axis=1).any()) if not both_small.dropna().empty else False
+    note = f"mixed date formats detected; {recovered} value(s) recovered by parsing each value separately"
+    if ambiguous:
+        note += " (slash dates such as 02/01/2024 are ambiguous and were read as month/day/year)"
+    return mixed, note + "."
+
+
 def _try_parse_date(v: str) -> bool:
     try:
         pd.to_datetime(v)
@@ -195,10 +218,9 @@ def _compute_quality_dimensions(df: pd.DataFrame, original_shape: tuple, missing
 def run_detective(filepath: str) -> dict:
     # ── Load file ────────────────────────────────────────────────
     try:
-        if filepath.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(filepath)
-        else:
-            df = pd.read_csv(filepath, low_memory=False)
+        from agents.io_utils import read_table
+        df = read_table(filepath)
+        io_notes = list(df.attrs.get("io_notes", []))
     except Exception as e:
         return {"error": str(e)}
 
@@ -231,7 +253,9 @@ def run_detective(filepath: str) -> dict:
     for col in df.columns:
         if _is_date_col(df[col]):
             try:
-                df[col] = pd.to_datetime(df[col], errors="coerce")
+                df[col], _dnote = _parse_dates(df[col])
+                if _dnote:
+                    io_notes.append(f"Column '{col}': {_dnote}")
                 date_cols.append(col)
             except Exception:
                 pass
@@ -374,6 +398,7 @@ def run_detective(filepath: str) -> dict:
         "high_cardinality_columns": high_cardinality_columns,
         "cleaning_summary": cleaning_summary,
         "original_shape": list(original_shape),
+        "io_notes": io_notes,
         "numeric_cols": numeric_cols,
         "categorical_cols": categorical_cols,
         "date_cols": date_cols,
