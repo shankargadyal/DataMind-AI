@@ -282,16 +282,21 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
         if bm:
             story.append(Paragraph(f"Best Model Metrics — {ml.get('best_model','')}", sty["h1"]))
             if task == "classification":
+                _macro = bm.get("f1_macro")
                 met_data = [
-                    ["Accuracy", "F1 Score", "Precision", "Recall"],
+                    ["Accuracy", "F1 (weighted)", "F1 (macro)", "Precision (weighted)", "Recall (weighted)"],
                     [
                         f"{round(bm.get('accuracy',0)*100,1)}%",
                         f"{round(bm.get('f1',0)*100,1)}%",
+                        f"{round(_macro*100,1)}%" if _macro is not None else "n/a",
                         f"{round(bm.get('precision',0)*100,1)}%",
                         f"{round(bm.get('recall',0)*100,1)}%",
                     ]
                 ]
-                story.append(tbl(met_data, [3.6*cm]*4, header_bg=C_SUCCESS))
+                story.append(tbl(met_data, [2.9*cm]*5, header_bg=C_SUCCESS))
+                story.append(Paragraph(
+                    "Weighted metrics average over classes in proportion to their size, so large classes dominate. "
+                    "Macro F1 counts every class equally and reveals poor results on small classes.", sty["small"]))
             else:
                 met_data = [
                     ["R² Score", "MAE", "RMSE"],
