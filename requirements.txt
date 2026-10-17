@@ -21,7 +21,7 @@ scikit-learn==1.5.1
 scipy==1.13.1
 
 # ── ML — Optional but strongly recommended ───────────────────────
-xgboost>=2.0.0
+xgboost>=2.0.0,<3.0.0  # 3.x breaks shap<0.47 (needed with numpy==1.26.4): SHAP silently disappears when XGBoost wins
 lightgbm>=4.0.0
 catboost>=1.2.0
 statsmodels>=0.14.0
