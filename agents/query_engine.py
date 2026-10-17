@@ -206,6 +206,15 @@ _MISSING_AFTER = re.compile(r"^\s*(?:is|are|was|were)?\s*(?:missing|null|nan|emp
 _BETWEEN = re.compile(r"^\s*(?:is|are)?\s*between\s+(-?\d+(?:\.\d+)?)\s+(?:and|to|-)\s+(-?\d+(?:\.\d+)?)", re.IGNORECASE)
 
 
+_JUXT = re.compile(r"^\s*(?:(?:at|in|from|on|as|of|is|are|was|were|=|:)\s+)?(?P<v>\"[^\"]+\"|'[^']+'|[A-Za-z0-9_.\-]+)", re.IGNORECASE)
+_ORPHAN = re.compile(
+    r"\b(?P<w>older than|younger than|aged|over|above|more than|greater than|exceeding|under|below|less than|fewer than|at least|at most)\s+"
+    r"(?P<n>-?\d+(?:\.\d+)?)(?P<yrs>\s*(?:years?|yrs?)(?:\s+old)?)?", re.IGNORECASE)
+_ORPHAN_OPS = {"older than": ">", "younger than": "<", "aged": "==", "over": ">", "above": ">", "more than": ">",
+               "greater than": ">", "exceeding": ">", "under": "<", "below": "<", "less than": "<", "fewer than": "<",
+               "at least": ">=", "at most": "<="}
+
+
 class _Cond(dict):
     """{'column','op','value','source','negated','pos'} – op in ==,!=,>,>=,<,<=,between,isna,notna"""
 
@@ -343,6 +352,103 @@ class _Parser:
                 self.consumed_cols.add(col)
                 self.consumed_spans.append((m.start(), m.end() + ma.end()))
 
+    # -- "col value" juxtaposition: "Pclass 1", "Embarked at S", "Sex male" ------
+    def parse_juxtaposed(self):
+        """A column mention immediately followed by one of ITS OWN values is an equality filter.
+        Strict by design: the value must exist in a categorical column, or be a number for a class-like
+        (<= 20 distinct values) numeric column. Anything else is left for the coverage guard to report."""
+        raw = self.message
+        known_cols = set(self.schema.norm.values())
+        for col in dict.fromkeys(c for c, _, _ in self.cols):
+            if col in self.consumed_cols:
+                continue
+            pat = re.compile(r"(?<![A-Za-z0-9])" + r"[\s_\-]*".join(map(re.escape, self.schema.norm[col].split())) + r"s?(?![A-Za-z0-9])", re.IGNORECASE)
+            for m in pat.finditer(raw):
+                if any(a <= m.start() < b for a, b in self.consumed_spans):
+                    continue
+                mm = _JUXT.match(raw[m.end():])
+                if not mm:
+                    continue
+                vl = mm.group("v").strip().strip("\"'").strip().lower()
+                if not vl or vl in _KEYWORDS or vl in known_cols:
+                    continue
+                ser = self.df[col]
+                val = None
+                if _is_num(ser):
+                    if re.fullmatch(r"-?\d+(?:\.\d+)?", vl) and ser.nunique(dropna=True) <= 20:
+                        val = _coerce_value(ser, vl, col, self.schema)
+                else:
+                    lookup = self.schema.cat_values.get(col) or {}
+                    if vl in lookup or _singular(vl) in {_singular(k) for k in lookup}:
+                        val = _coerce_value(ser, vl, col, self.schema)
+                if val is None:
+                    continue
+                self.conds.append(_Cond(column=col, op="==", value=val, source="explicit", negated=False, pos=m.start()))
+                self.consumed_cols.add(col)
+                self.consumed_spans.append((m.start(), m.end() + mm.end()))
+                break
+
+    # -- comparator + number with no adjacent column: "males over 40" -----------
+    def parse_orphan_comparisons(self):
+        """'older than 40' / 'over 40 years' bind to an age-like column. A bare 'over 40' is ambiguous
+        (Age? Fare?) so we ask instead of guessing or silently ignoring it."""
+        for m in _ORPHAN.finditer(self.message):
+            if any(a <= m.start("n") < b for a, b in self.consumed_spans):
+                continue
+            word = m.group("w").lower()
+            num = float(m.group("n"))
+            if any(c.get("op") in {">", ">=", "<", "<=", "==", "between"} and
+                   num in ([float(x) for x in c["value"]] if isinstance(c.get("value"), (tuple, list)) else [self._f(c.get("value"))])
+                   for c in self.conds):
+                continue
+            op = _ORPHAN_OPS[word]
+            age_words = word in {"older than", "younger than", "aged"} or bool(m.group("yrs"))
+            numeric = [c for c in self.schema.columns if _is_num(self.df[c])]
+            if age_words:
+                age_like = [c for c in numeric if re.search(r"(^| )age( |$)", self.schema.norm[c])]
+                if len(age_like) == 1:
+                    col = age_like[0]
+                    val = int(num) if num.is_integer() and pd.api.types.is_integer_dtype(self.df[col]) else num
+                    self.conds.append(_Cond(column=col, op=op, value=val, source="explicit", negated=False, pos=m.start()))
+                    self.consumed_cols.add(col)
+                    self.consumed_spans.append((m.start(), m.end()))
+                    self.interpretations.append(f"'{m.group(0).strip()}' interpreted as {col} {op} {_vtxt(val)}")
+                    continue
+            raise Clarify(f"'{m.group(0).strip()}' needs a column, but none was named. Which numeric column does it apply to? "
+                          f"Numeric columns: {', '.join(numeric[:15])}. (Nothing was calculated.)")
+
+    @staticmethod
+    def _f(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    def assert_numbers_explained(self):
+        """Coverage guard: every number in the question must be used by a condition (or be a top-N / part of a
+        column name). Otherwise part of the question was NOT applied and a 'computed' answer would be wrong."""
+        explained = set()
+        for c in self.conds:
+            v = c.get("value")
+            for x in (v if isinstance(v, (tuple, list)) else [v]):
+                f = self._f(x)
+                if f is not None:
+                    explained.add(f)
+        col_nums = {float(n) for c, _, _ in self.cols for n in re.findall(r"\d+(?:\.\d+)?", self.schema.norm[c])}
+        low = self.message
+        left = []
+        for m in re.finditer(r"(?<![\w.])-?\d+(?:\.\d+)?(?!\w)", low):
+            if re.search(r"\b(top|first|bottom)\s+$", low[:m.start()], re.I):
+                continue
+            f = float(m.group(0))
+            if f in explained or f in col_nums:
+                continue
+            left.append(m.group(0))
+        if left:
+            raise Clarify(f"I could not tell how to apply {', '.join(dict.fromkeys(left))} from your question to a column, "
+                          f"so I did not calculate anything (the result would silently ignore part of your question). "
+                          f"Please name the column, e.g. 'Age > 40' or 'Pclass = 3'.")
+
     def _trim_value(self, col: str, val: str) -> str:
         if val[:1] in "\"'":
             return val
@@ -441,11 +547,11 @@ class _Parser:
         m = re.search(r"[\s_\-]*".join(map(re.escape, words)), self.low) if words else None
         return m.start() if m else 0
 
-    def add_binary_outcomes(self):
+    def add_binary_outcomes(self, exclude=()):
         """'how many passengers survived' -> the binary column named in the question is the outcome (positive class)."""
         toks = [(m.group(), m.start()) for m in re.finditer(r"[a-z0-9']+", self.low)]
         for col in dict.fromkeys(c for c, _, _ in self.cols):
-            if col in self.consumed_cols or any(c["column"] == col for c in self.conds):
+            if col in exclude or col in self.consumed_cols or any(c["column"] == col for c in self.conds):
                 continue
             bp = _binary_positive(self.df[col])
             if not bp:
@@ -677,11 +783,13 @@ def op_aggregate(df, p, funcs, cols, group_cols=None, **_):
         s = sub[c]
         nn = int(s.notna().sum())
         entry = {"column": c, "non_null": nn, "missing": int(s.isna().sum())}
+        entry["sum"] = _fmt(s.sum()) if nn else None
         for f in funcs:
             entry[f] = _fmt(getattr(s, f)()) if nn else None
         out.append(entry)
         parts = ", ".join(f"{f} = {entry[f]}" for f in funcs)
-        note = f" (based on {nn:,} non-missing of {n:,} rows)" if nn != n else f" (n = {n:,})"
+        sum_txt = f"sum = {entry['sum']}, " if "mean" in funcs and "sum" not in funcs and entry["sum"] is not None else ""
+        note = f" ({sum_txt}based on {nn:,} non-missing of {n:,} rows)" if nn != n else f" ({sum_txt}n = {n:,})"
         lines.append(f"- **{c}**: {parts}{note}")
         if nn != n:
             lim.append(f"{c}: {n - nn:,} missing values were excluded from the calculation.")
@@ -775,12 +883,35 @@ def op_crosstab(df, p, a, b, **_):
 # ═════════════════════════════════════════════════════════════════
 # router
 # ═════════════════════════════════════════════════════════════════
+# Intent gate: questions about the MODEL / explanations / recommendations belong to RAG, not to DataFrame
+# calculation ("Which features matter most?" must not become a subset summary, and "...ranks the top
+# features highest" must not be read as a MAX request). Conservative: it only fires when the message has
+# no strong calculation phrase, and model-words that are real column names never count.
+_MODEL_INTENT = re.compile(
+    r"\b(models?|shap|feature importances?|features?|accuracy|precision|recall|f1|auc|roc|confusion matrix|leaderboard|"
+    r"algorithms?|overfit\w*|explain\w*|why|recommend\w*|insights?|interpret\w*|should i|drivers?|drives?|matters?|important|"
+    r"importance|risks?)\b", re.IGNORECASE)
+_STRONG_COMPUTE = re.compile(
+    r"\b(how many|number of|count of|percentage of|percent of|what percent\w*|average|avg|median|sum of|total of|"
+    r"mean (?:of|by|value)|the mean|missing values?|null values?|duplicates?|rows|columns)\b", re.IGNORECASE)
+
+
+def _is_model_or_explanation_intent(df: pd.DataFrame, message: str) -> bool:
+    if _STRONG_COMPUTE.search(message):
+        return False
+    colwords = {w for c in df.columns for w in _norm(c).split()} | {_singular(w) for c in df.columns for w in _norm(c).split()}
+    found = {m.group(0).lower() for m in _MODEL_INTENT.finditer(message)}
+    return any(w not in colwords and _singular(w) not in colwords for w in found)
+
+
 def answer_question(df: pd.DataFrame | None, message: str) -> dict:
     """Public entry point. Never raises; returns a structured result dict."""
     if df is None:
         return _result("error", "unavailable", "The original dataset is not available for this job, so I cannot calculate this. "
                        "Please re-upload the file.", limitations=["dataset_unavailable"])
     try:
+        if _is_model_or_explanation_intent(df, message):
+            return _result("unsupported", "unsupported", "")   # -> RAG / report context in the chat route
         return _route(df, message)
     except Clarify as e:
         return _result("clarify", "clarification", str(e))
@@ -791,11 +922,24 @@ def answer_question(df: pd.DataFrame | None, message: str) -> dict:
 
 
 def _route(df: pd.DataFrame, message: str) -> dict:
+    holder: dict = {}
+    res = _route_impl(df, message, holder)
+    # Coverage guard: never return a "computed" answer that ignored part of the question.
+    if res.get("status") == "ok" and holder.get("p") is not None:
+        holder["p"].assert_numbers_explained()
+    return res
+
+
+def _route_impl(df: pd.DataFrame, message: str, _holder: dict | None = None) -> dict:
     low = message.lower().replace("non-", "non ")
     toks = set(_tokens(low))
     p = _Parser(df, message)
+    if _holder is not None:
+        _holder["p"] = p
     p.parse_explicit()
+    p.parse_juxtaposed()
     p.parse_implicit()
+    p.parse_orphan_comparisons()
     mentioned = list(dict.fromkeys(c for c, _, _ in p.cols))
     def has(*ws):
         return any((w in low) if (" " in w or w == "%") else (w in toks) for w in ws)
@@ -895,6 +1039,11 @@ def _route(df: pd.DataFrame, message: str) -> dict:
             gtxt = _norm(mg.group(1))
             group_cols = [c for c in mentioned if _norm(c) and _norm(c) in gtxt]
             num_cols = [c for c in num_cols if c not in group_cols]
+        # "average Age of passengers who survived": a mentioned 0/1 outcome column is a FILTER, not a
+        # numeric target, whenever another numeric column is available as the target.
+        if any(not _binary_positive(df[c]) for c in num_cols):
+            p.add_binary_outcomes(exclude=set(group_cols))
+            num_cols = [c for c in num_cols if not any(k["column"] == c for k in p.conds)]
         if not num_cols:
             raise Clarify("Which numeric column should I calculate that for? Numeric columns: " + ", ".join(_numeric_cols(df)[:15]) + ".")
         bad = [c for c in group_cols if df[c].nunique(dropna=True) > MAX_GROUPS]
