@@ -189,11 +189,74 @@ def _check_summary_consistency(dataset_summary: dict) -> list[dict]:
     return flags
 
 
-def run_consistency_checks(rep: dict, det: dict, ml: dict, dataset_summary: dict | None = None) -> list[dict]:
+
+def _check_degenerate_evaluation(ml: dict) -> list[dict]:
+    """A hold-out set that contains no examples of some class makes that class's precision/recall/F1
+    (and any 100% accuracy) meaningless: the model may simply be predicting the majority class."""
+    flags = []
+    if ml.get("task_type") != "classification":
+        return flags
+    models = [m for m in (ml.get("models") or []) if not m.get("error")]
+    best = next((m for m in models if m.get("is_best")), None)
+    cm = ((best or {}).get("metrics") or {}).get("confusion_matrix")
+    if not cm:
+        return flags
+    labels = ml.get("confusion_labels") or list(range(len(cm)))
+    absent = [str(labels[i]) if i < len(labels) else str(i) for i, row in enumerate(cm) if sum(row) == 0]
+    if absent:
+        flags.append(_flag(
+            "degenerate_evaluation",
+            f"The hold-out set contains no examples of class(es) {', '.join(absent)}, so precision/recall/F1 and the "
+            f"reported score are not meaningful for them (the model may only be predicting the majority class). "
+            f"More data for the rare class is needed for a reliable evaluation.", "warn"))
+    return flags
+
+
+
+def _check_no_better_than_baseline(ml: dict) -> list[dict]:
+    """A classifier that does not beat 'always predict the most common class' has learned nothing useful
+    (typical causes: dirty/over-split target labels, no signal in the features, tiny hold-out)."""
+    if ml.get("task_type") != "classification":
+        return []
+    models = [m for m in (ml.get("models") or []) if not m.get("error")]
+    best = next((m for m in models if m.get("is_best")), None)
+    mt = (best or {}).get("metrics") or {}
+    cm, acc = mt.get("confusion_matrix"), mt.get("accuracy")
+    if not cm or acc is None:
+        return []
+    total = sum(sum(r) for r in cm)
+    if total <= 0:
+        return []
+    baseline = max(sum(r) for r in cm) / total
+    margin = max(0.02, (baseline * (1 - baseline) / total) ** 0.5)   # ~1 standard error: small hold-outs are noisy
+    if baseline < 1.0 and acc <= baseline + margin:
+        predicted = sum(1 for j in range(len(cm[0])) if sum(row[j] for row in cm) > 0)
+        single = " The selected model predicts a single class for every hold-out row." if predicted == 1 else ""
+        return [_flag("no_better_than_baseline",
+                      f"Best model accuracy ({acc:.1%}) is not better than always predicting the most common class "
+                      f"({baseline:.1%}) on the hold-out set.{single} Accuracy alone can hide a useful model on imbalanced "
+                      f"data, so also check per-class recall / macro F1; if recall is poor, look for inconsistent target "
+                      f"labels (e.g. 'Yes'/'yes'/'Y') or weak features.", "warn")]
+    return []
+
+def _check_requested_target(requested_target: str | None, ml: dict) -> list[dict]:
+    """The user asked for a specific target column but the pipeline used a different one."""
+    used = ml.get("target_column")
+    if requested_target and used and requested_target != used:
+        return [_flag("target_column_not_used",
+                      f"Requested target column '{requested_target}' was not found in the dataset; "
+                      f"'{used}' was auto-selected instead. Check the column name.", "warn")]
+    return []
+
+def run_consistency_checks(rep: dict, det: dict, ml: dict, dataset_summary: dict | None = None,
+                           requested_target: str | None = None) -> list[dict]:
     flags = []
     flags += _check_missing_consistency(det, dataset_summary or {})
     flags += _check_model_consistency(ml, rep)
     flags += _check_summary_consistency(dataset_summary or {})
+    flags += _check_degenerate_evaluation(ml)
+    flags += _check_no_better_than_baseline(ml)
+    flags += _check_requested_target(requested_target, ml)
     return flags
 
 
