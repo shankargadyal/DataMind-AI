@@ -16,8 +16,28 @@ constraints on Render/Railway free tiers).
 """
 
 from __future__ import annotations
-from sklearn.feature_extraction.text import TfidfVectorizer
+import re
+from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _stem(w: str) -> str:
+    """Very light normalisation so 'features'/'feature', 'survived'/'survive' share a term.
+    Deliberately tiny (no new dependency); applied identically to chunks and queries."""
+    for suf in ("ing", "ed", "es", "s"):
+        if w.endswith(suf) and len(w) - len(suf) >= 4:
+            w = w[: -len(suf)]
+            break
+    if w.endswith("e") and len(w) > 4:
+        w = w[:-1]
+    return w
+
+
+def _analyze(text: str) -> list[str]:
+    return [_stem(t) for t in _TOKEN_RE.findall(str(text).lower())
+            if t not in ENGLISH_STOP_WORDS and len(t) > 1]
 
 
 def _safe_str(x, limit=500):
@@ -68,7 +88,8 @@ def build_chunks(analysis_data: dict, ml_result: dict = None, det_result: dict =
     if ml_rec:
         chunks.append({
             "text": f"Best model: {ml_rec.get('best_model','')}, task: {ml_rec.get('task_type','')}, "
-                    f"target column: {ml_rec.get('target_column','')}, score: {ml_rec.get('score','')}",
+                    f"target column: {ml_rec.get('target_column','')}, "
+                    f"score: {ml_rec.get('best_score', ml_rec.get('score', ''))}",
             "source": "ml_leaderboard",
         })
     for i, fi in enumerate((ml_rec.get("feature_importances") or [])[:20]):
@@ -99,12 +120,20 @@ class JobRAGIndex:
 
     def __init__(self, chunks: list[dict]):
         self.chunks = chunks
-        texts = [c["text"] for c in chunks] or [""]
-        self.vectorizer = TfidfVectorizer(stop_words="english", max_features=2000)
-        self.matrix = self.vectorizer.fit_transform(texts)
+        self.vectorizer = None
+        self.matrix = None
+        if not chunks:
+            return
+        try:
+            self.vectorizer = TfidfVectorizer(analyzer=_analyze, max_features=2000)
+            self.matrix = self.vectorizer.fit_transform([c["text"] for c in chunks])
+        except ValueError:
+            # e.g. "empty vocabulary" when every chunk is only stop words: behave as an empty index.
+            self.vectorizer = None
+            self.matrix = None
 
     def retrieve(self, query: str, k: int = 6) -> list[dict]:
-        if not self.chunks:
+        if not self.chunks or self.vectorizer is None:
             return []
         q_vec = self.vectorizer.transform([query])
         sims = cosine_similarity(q_vec, self.matrix).flatten()
