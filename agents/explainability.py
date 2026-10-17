@@ -71,6 +71,13 @@ def generate_shap_plots(model, X_sample: np.ndarray, feature_cols: list, task_ty
     task_type: "classification" or "regression" (clustering/forecasting skip this)
     instance_idx: which row to use for the local waterfall explanation
     """
+    from agents.ml_engineer import _shap_unsafe
+    if _shap_unsafe(model):
+        return {
+            "available": False,
+            "reason": "SHAP plots are skipped for CatBoost multiclass models (known native crash in the shap/catboost "
+                      "combination); feature importance from the model itself is used instead.",
+        }
     if not HAS_SHAP:
         return {
             "available": False,
