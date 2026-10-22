@@ -239,6 +239,18 @@ def _check_no_better_than_baseline(ml: dict) -> list[dict]:
                       f"labels (e.g. 'Yes'/'yes'/'Y') or weak features.", "warn")]
     return []
 
+
+def _check_leakage(ml: dict) -> list[dict]:
+    """The model's score may be inflated because the target is (almost) a formula of its own inputs."""
+    rel = ml.get("data_relationships") or {}
+    leaks = rel.get("target_leakage") or []
+    if not leaks:
+        return []
+    lines = [x for x in (rel.get("summary") or []) if x.startswith(("Target", "Feature"))] or ["Target leakage suspected."]
+    return [_flag("leakage_suspected",
+                  " ".join(lines[:2]) + " The reported score is likely inflated; remove the flagged column(s) and re-run "
+                  "to see the honest performance.", "warn")]
+
 def _check_requested_target(requested_target: str | None, ml: dict) -> list[dict]:
     """The user asked for a specific target column but the pipeline used a different one."""
     used = ml.get("target_column")
@@ -256,6 +268,7 @@ def run_consistency_checks(rep: dict, det: dict, ml: dict, dataset_summary: dict
     flags += _check_summary_consistency(dataset_summary or {})
     flags += _check_degenerate_evaluation(ml)
     flags += _check_no_better_than_baseline(ml)
+    flags += _check_leakage(ml)
     flags += _check_requested_target(requested_target, ml)
     return flags
 
