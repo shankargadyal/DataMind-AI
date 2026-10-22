@@ -327,6 +327,15 @@ def _permutation_importance_fallback(model, X_eval, y_eval, feature_cols, scorin
         return []
 
 
+def _data_relationships(df, target_col) -> dict:
+    """Copies / bins / lookups / ratios between columns and target leakage, inferred from the data alone."""
+    try:
+        from agents.leakage_check import analyze_relationships
+        return analyze_relationships(df, target=target_col)
+    except Exception:
+        return {"id_columns": [], "near_duplicates": [], "derived_columns": [], "target_leakage": [], "summary": []}
+
+
 def _get_feature_importance(model, X_sample: np.ndarray, feature_cols: list,
                             X_eval=None, y_eval=None, scoring=None) -> list:
     importances = []
@@ -705,6 +714,7 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
         "feature_count":        len(feature_cols),
         "future_prediction":    future_pred,
         "class_imbalance":      imbalance,
+        "data_relationships":   _data_relationships(df, target_col),
         "exploratory_mode":     False,
         "score_metric":         primary_metric,
         "evaluation_protocol":  evaluation_protocol,
