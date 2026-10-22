@@ -309,6 +309,21 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
                 story.append(tbl(met_data, [4.8*cm]*3, header_bg=C_SUCCESS))
             story.append(Spacer(1, 8))
 
+        # Data relationships & leakage warnings (inferred from the data alone)
+        _rel = ml.get("data_relationships") or {}
+        _rel_lines = _rel.get("summary") or []
+        if _rel_lines:
+            story.append(Paragraph("Data Relationships &amp; Leakage Warnings", sty["h1"]))
+            story.append(Paragraph(
+                "Found by comparing the columns with each other (no knowledge of how the file was made). Columns that are "
+                "copies, bins or lookups of others add no independent information, and a target that is a formula of its "
+                "inputs makes any score look better than it is.", sty["small"]))
+            for _line in _rel_lines[:8]:
+                story.append(Paragraph("&bull; " + _line.replace("&", "&amp;").replace("<", "&lt;"), sty["body"]))
+            if len(_rel_lines) > 8:
+                story.append(Paragraph(f"... and {len(_rel_lines) - 8} more.", sty["small"]))
+            story.append(Spacer(1, 8))
+
         # Prediction Confidence Summary — confidence score, risk level, and a
         # plain-English reason, applied at the model level (per-row prediction
         # confidence isn't retained past the pipeline run, so this summarizes
