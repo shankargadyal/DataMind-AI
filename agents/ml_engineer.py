@@ -29,29 +29,31 @@ import warnings
 warnings.filterwarnings("ignore")
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
-try:
-    from xgboost import XGBClassifier, XGBRegressor
-    HAS_XGB = True
-except ImportError:
-    HAS_XGB = False
 
-try:
-    from lightgbm import LGBMClassifier, LGBMRegressor
-    HAS_LGBM = True
-except ImportError:
-    HAS_LGBM = False
+def _load_optional_models():
+    """Import optional ML libraries only when model training is requested."""
+    optional = {}
 
-try:
-    from catboost import CatBoostClassifier, CatBoostRegressor
-    HAS_CATBOOST = True
-except ImportError:
-    HAS_CATBOOST = False
+    try:
+        from xgboost import XGBClassifier, XGBRegressor
+        optional["xgboost"] = (XGBClassifier, XGBRegressor)
+    except Exception as exc:
+        print(f"[INFO] XGBoost unavailable: {type(exc).__name__}")
 
-try:
-    import shap
-    HAS_SHAP = True
-except ImportError:
-    HAS_SHAP = False
+    try:
+        from lightgbm import LGBMClassifier, LGBMRegressor
+        optional["lightgbm"] = (LGBMClassifier, LGBMRegressor)
+    except Exception as exc:
+        print(f"[INFO] LightGBM unavailable: {type(exc).__name__}")
+
+    try:
+        from catboost import CatBoostClassifier, CatBoostRegressor
+        optional["catboost"] = (CatBoostClassifier, CatBoostRegressor)
+    except Exception as exc:
+        print(f"[INFO] CatBoost unavailable: {type(exc).__name__}")
+
+    return optional
+
 
 from agents import clustering as _clustering_agent
 from agents import forecasting as _forecasting_agent
@@ -152,46 +154,65 @@ def _add_polynomial_features(X_train, X_test, feature_cols, top_n=5):
 
 # ── Model catalogue ─────────────────────────────────────────────────────────
 
+
 def _get_models(task_type: str):
+    optional = _load_optional_models()
+
     if task_type == "classification":
         models = [
             ("Logistic Regression", LogisticRegression(max_iter=500, random_state=42)),
-            ("Random Forest",       RandomForestClassifier(n_estimators=100, random_state=42)),
-            ("Gradient Boosting",   GradientBoostingClassifier(n_estimators=100, random_state=42)),
+            ("Random Forest", RandomForestClassifier(n_estimators=100, random_state=42)),
+            ("Gradient Boosting", GradientBoostingClassifier(n_estimators=100, random_state=42)),
             ("K-Nearest Neighbors", KNeighborsClassifier(n_neighbors=5)),
         ]
-        if HAS_XGB:
+
+        if "xgboost" in optional:
+            XGBClassifier, _ = optional["xgboost"]
             models.append(("XGBoost", XGBClassifier(
                 n_estimators=100, random_state=42, verbosity=0,
                 use_label_encoder=False, eval_metric="logloss"
             )))
-        if HAS_LGBM:
+
+        if "lightgbm" in optional:
+            LGBMClassifier, _ = optional["lightgbm"]
             models.append(("LightGBM", LGBMClassifier(
                 n_estimators=100, random_state=42, verbosity=-1
             )))
-        if HAS_CATBOOST:
+
+        if "catboost" in optional:
+            CatBoostClassifier, _ = optional["catboost"]
             models.append(("CatBoost", CatBoostClassifier(
-                iterations=100, random_state=42, verbose=False, allow_writing_files=False
+                iterations=100, random_state=42, verbose=False,
+                allow_writing_files=False
             )))
     else:
         models = [
-            ("Ridge Regression",  Ridge(alpha=1.0)),
-            ("Random Forest",     RandomForestRegressor(n_estimators=100, random_state=42)),
+            ("Ridge Regression", Ridge(alpha=1.0)),
+            ("Random Forest", RandomForestRegressor(n_estimators=100, random_state=42)),
             ("Gradient Boosting", GradientBoostingRegressor(n_estimators=100, random_state=42)),
         ]
-        if HAS_XGB:
+
+        if "xgboost" in optional:
+            _, XGBRegressor = optional["xgboost"]
             models.append(("XGBoost Regressor", XGBRegressor(
                 n_estimators=100, random_state=42, verbosity=0
             )))
-        if HAS_LGBM:
+
+        if "lightgbm" in optional:
+            _, LGBMRegressor = optional["lightgbm"]
             models.append(("LightGBM Regressor", LGBMRegressor(
                 n_estimators=100, random_state=42, verbosity=-1
             )))
-        if HAS_CATBOOST:
+
+        if "catboost" in optional:
+            _, CatBoostRegressor = optional["catboost"]
             models.append(("CatBoost Regressor", CatBoostRegressor(
-                iterations=100, random_state=42, verbose=False, allow_writing_files=False
+                iterations=100, random_state=42, verbose=False,
+                allow_writing_files=False
             )))
+
     return models
+
 
 
 def _safe_cv(model, X_train, y_train, scoring: str, task_type: str):
@@ -335,46 +356,75 @@ def _data_relationships(df, target_col) -> dict:
     except Exception:
         return {"id_columns": [], "near_duplicates": [], "derived_columns": [], "target_leakage": [], "summary": []}
 
-
-def _get_feature_importance(model, X_sample: np.ndarray, feature_cols: list,
-                            X_eval=None, y_eval=None, scoring=None) -> list:
+def _get_feature_importance(
+    model, X_sample: np.ndarray, feature_cols: list,
+    X_eval=None, y_eval=None, scoring=None
+) -> list:
     importances = []
 
-    if HAS_SHAP and not _shap_unsafe(model):
-        try:
-            explainer   = shap.Explainer(model, X_sample[:100])
+    # Load SHAP only when feature importance is requested.
+    try:
+        if not _shap_unsafe(model):
+            import shap
+
+            explainer = shap.Explainer(model, X_sample[:100])
             shap_values = explainer(X_sample[:100])
             vals = np.abs(shap_values.values)
+
             if vals.ndim == 3:
                 vals = vals.mean(axis=2)
+
             mean_shap = vals.mean(axis=0)
             for col, imp in zip(feature_cols, mean_shap):
-                importances.append({"feature": col, "importance": round(float(imp), 6), "method": "shap"})
-            importances.sort(key=lambda x: x["importance"], reverse=True)
-            return importances[:15]
-        except Exception:
-            pass
+                importances.append({
+                    "feature": col,
+                    "importance": round(float(imp), 6),
+                    "method": "shap",
+                })
 
+            importances.sort(
+                key=lambda x: x["importance"], reverse=True
+            )
+            return importances[:15]
+    except Exception:
+        pass
+
+    # Fall back to built-in tree feature importance.
     if hasattr(model, "feature_importances_"):
         fi = model.feature_importances_
-        # align to min length in case poly added cols
-        pairs = list(zip(feature_cols, fi))[:len(feature_cols)]
-        for col, imp in pairs:
-            importances.append({"feature": col, "importance": round(float(imp), 6), "method": "gini"})
-        importances.sort(key=lambda x: x["importance"], reverse=True)
+        for col, imp in list(zip(feature_cols, fi))[:len(feature_cols)]:
+            importances.append({
+                "feature": col,
+                "importance": round(float(imp), 6),
+                "method": "gini",
+            })
+        importances.sort(
+            key=lambda x: x["importance"], reverse=True
+        )
         return importances[:15]
 
+    # Fall back to linear-model coefficients.
     if hasattr(model, "coef_"):
         coef = np.abs(model.coef_).flatten()[:len(feature_cols)]
         for col, imp in zip(feature_cols, coef):
-            importances.append({"feature": col, "importance": round(float(imp), 6), "method": "coefficient"})
-        importances.sort(key=lambda x: x["importance"], reverse=True)
+            importances.append({
+                "feature": col,
+                "importance": round(float(imp), 6),
+                "method": "coefficient",
+            })
+        importances.sort(
+            key=lambda x: x["importance"], reverse=True
+        )
         return importances[:15]
 
-    perm = _permutation_importance_fallback(model, X_eval, y_eval, feature_cols, scoring)
+    # Final fallback for models such as KNN.
+    perm = _permutation_importance_fallback(
+        model, X_eval, y_eval, feature_cols, scoring
+    )
     if perm:
         return perm
-    return []   # no honest importance available for this model type — never fabricate scores
+
+    return []  # no honest importance available for this model type — never fabricate scores
 
 
 # ── Future prediction ───────────────────────────────────────────────────────
