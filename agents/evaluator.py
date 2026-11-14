@@ -251,6 +251,79 @@ def _check_leakage(ml: dict) -> list[dict]:
                   " ".join(lines[:2]) + " The reported score is likely inflated; remove the flagged column(s) and re-run "
                   "to see the honest performance.", "warn")]
 
+
+def _check_selection_mismatch(ml: dict) -> list[dict]:
+    """The model chosen as 'best' is selected by cross-validated score on the TRAINING split, but the
+    leaderboard displays hold-out score. On a real distribution shift (e.g. a time-series regime change)
+    the two can disagree, and the report would star a model that another row visibly beats on its own
+    table — with no explanation. This does not say the selection is WRONG (CV-based selection is the more
+    honest choice for model picking); it only says so plainly, so the reader isn't confused by the table."""
+    models = [m for m in (ml.get("models") or []) if not m.get("error") and m.get("score") is not None]
+    best = next((m for m in models if m.get("is_best")), None)
+    if not best or len(models) < 2:
+        return []
+    metric = ml.get("evaluation_protocol", {}).get("primary_metric") or best.get("score_metric") or "score"
+    top_holdout = max(models, key=lambda m: m["score"])
+    if top_holdout["name"] != best["name"] and top_holdout["score"] - best["score"] > 1e-9:
+        sel_metric = ml.get("selection_metric", "selection_score")
+        return [_flag("selection_metric_differs_from_displayed_score",
+                      f"'{best['name']}' was selected as the best model by {sel_metric} "
+                      f"({best.get('selection_score')}), but '{top_holdout['name']}' has a higher displayed "
+                      f"hold-out {metric} ({top_holdout['score']} vs {best['score']}). The leaderboard's "
+                      f"score column and the selection rule are not the same metric — see "
+                      f"evaluation_protocol.selection_rule for which one chose the winner.", "warn")]
+    return []
+
+
+def _check_regression_no_skill(ml: dict) -> list[dict]:
+    """R² <= 0 means the model is no better than (or worse than) always predicting the mean — it has
+    learned nothing usable. This is the regression counterpart of _check_no_better_than_baseline, and is
+    what should stop a report from calling a negative-R² model's output a reliable forecast."""
+    if ml.get("task_type") != "regression":
+        return []
+    best = next((m for m in (ml.get("models") or []) if m.get("is_best")), None)
+    if not best or best.get("score") is None:
+        return []
+    r2 = best["score"]
+    if r2 <= 0:
+        return [_flag("regression_no_skill",
+                      f"Best model R² ({r2:.3f}) is at or below zero on the hold-out set: it predicts no better "
+                      f"than always guessing the average value, so its forecasts should not be called reliable. "
+                      f"Likely causes: the target has little relationship to the available features, not enough "
+                      f"history, or (for time-series data) a regime change between the training and test periods.",
+                      "fail" if r2 < -0.05 else "warn")]
+    return []
+
+
+def _check_degraded_mode(rep: dict) -> list[dict]:
+    """When the LLM call failed, the Reporter falls back to generic template text (e.g. 'the AI has analysed
+    your data...reliably forecast future outcomes') that does not reflect the actual model quality. The
+    report must say this happened instead of presenting fallback text as a normal AI-generated summary."""
+    if rep.get("degraded_mode"):
+        return [_flag("degraded_mode_not_disclosed",
+                      "The AI narrative (executive summary / insights / recommendations) could not be generated "
+                      "and generic fallback text was used instead. The report must disclose this rather than "
+                      "presenting the fallback text as a normal AI-written summary.", "warn")]
+    return []
+
+
+def _check_forecast_sanity(ml: dict) -> list[dict]:
+    """A forecast section with no target name and Trend R² / Std Error of exactly 0 is very likely printing
+    dict.get(key, 0) defaults for keys that were never computed — not a genuine zero-variance result."""
+    fut = ml.get("future_prediction") or {}
+    if not fut:
+        return []
+    flags = []
+    if not fut.get("target"):
+        flags.append(_flag("forecast_missing_target",
+                           "The forecast section has no target column name recorded.", "warn"))
+    if fut.get("trend_r2") in (0, 0.0, None) and fut.get("std_error") in (0, 0.0, None):
+        flags.append(_flag("forecast_suspected_default_values",
+                           "Trend R² and Std Error are both exactly 0, which is almost always a missing-data "
+                           "default rather than a genuine calculation — check whether these fields are actually "
+                           "computed for this forecast.", "warn"))
+    return flags
+
 def _check_requested_target(requested_target: str | None, ml: dict) -> list[dict]:
     """The user asked for a specific target column but the pipeline used a different one."""
     used = ml.get("target_column")
@@ -270,6 +343,15 @@ def run_consistency_checks(rep: dict, det: dict, ml: dict, dataset_summary: dict
     flags += _check_no_better_than_baseline(ml)
     flags += _check_leakage(ml)
     flags += _check_requested_target(requested_target, ml)
+    flags += _check_selection_mismatch(ml)
+    flags += _check_regression_no_skill(ml)
+    # NOTE: _check_degraded_mode() exists and is unit-tested but is deliberately NOT wired into the
+    # blocking review chain here. merge_flags() treats ANY non-empty flag list as FLAGGED (holds the job
+    # for human review), and now that the fallback narrative text itself is conditioned on real model
+    # skill (see reporter.py), bare degraded_mode no longer implies an unsupported claim reached the
+    # report -- forcing a manual review on every LLM timeout would be a disproportionate UX regression.
+    # Disclosure instead happens directly in the PDF (see report_generator.py's degraded-mode note).
+    flags += _check_forecast_sanity(ml)
     return flags
 
 
