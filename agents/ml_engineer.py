@@ -215,22 +215,35 @@ def _get_models(task_type: str):
 
 
 
-def _safe_cv(model, X_train, y_train, scoring: str, task_type: str):
+def _safe_cv(model, X_train, y_train, scoring: str, task_type: str, is_timeseries: bool = False):
     """Cross-validated score on the TRAINING split only. Returns (mean, std, folds, note).
-    Returns (None, None, 0, reason) when CV is not statistically valid — never a fake 0.0."""
+    Returns (None, None, 0, reason) when CV is not statistically valid — never a fake 0.0.
+
+    For time-series regression, plain KFold(shuffle=False) still trains 2 of its 3 folds on rows that
+    are NEWER than the fold being scored (shuffle=False only stops rows being reordered WITHIN a fold,
+    it does not stop a later fold's rows appearing in an earlier fold's training set). This silently lets
+    model SELECTION see the future even though shuffle=False looks safe at a glance. TimeSeriesSplit
+    instead guarantees every test fold is strictly later than every row used to train it.
+    """
     from sklearn.base import clone
     if task_type == "classification":
         _, counts = np.unique(y_train, return_counts=True)
         folds = int(min(3, counts.min())) if len(counts) else 0
         if folds < 2:
             return None, None, 0, "cross-validation skipped: smallest class in the training split has < 2 members"
+        cv = folds
     else:
         folds = 3 if len(y_train) >= 30 else 0
         if folds < 2:
             return None, None, 0, "cross-validation skipped: too few training rows"
+        if is_timeseries:
+            from sklearn.model_selection import TimeSeriesSplit
+            cv = TimeSeriesSplit(n_splits=folds)
+        else:
+            cv = folds
     try:
-        cv = cross_val_score(clone(model), X_train, y_train, cv=folds, scoring=scoring)
-        return round(float(cv.mean()), 4), round(float(cv.std()), 4), folds, ""
+        scores = cross_val_score(clone(model), X_train, y_train, cv=cv, scoring=scoring)
+        return round(float(scores.mean()), 4), round(float(scores.std()), 4), folds, ""
     except Exception as e:
         return None, None, 0, f"cross-validation failed: {type(e).__name__}"
 
@@ -252,7 +265,7 @@ def _safe_cv_classification(model, X_train, y_train):
         return None, None, None, 0, f"cross-validation failed: {type(e).__name__}"
 
 
-def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type: str, n_classes: int = 0) -> dict:
+def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type: str, n_classes: int = 0, is_timeseries: bool = False) -> dict:
     y_pred = model.predict(X_test)
     if task_type == "classification":
         avg = "weighted"
@@ -276,7 +289,7 @@ def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type: str, n_cla
             "averaging":         "precision/recall/f1 = weighted by class size; f1_macro = unweighted mean over classes",
         }
     rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-    cv_mean, cv_std, folds, cv_note = _safe_cv(model, X_train, y_train, "r2", task_type)
+    cv_mean, cv_std, folds, cv_note = _safe_cv(model, X_train, y_train, "r2", task_type, is_timeseries)
     return {
         "r2":       round(float(r2_score(y_test, y_pred)), 4),
         "mae":      round(float(mean_absolute_error(y_test, y_pred)), 4),
@@ -435,6 +448,23 @@ def _future_prediction(model, scaler, feature_cols, df_feat, target_col, steps=1
         recent = historical_y[-min(10, len(historical_y)):]
         trend_per_step = (recent[-1] - recent[0]) / max(len(recent) - 1, 1)
         recent_std = float(np.std(recent)) if len(recent) > 1 else 0.0
+
+        # Fit quality of the LINEAR TREND against the actual recent history (R^2 of recent vs. the straight
+        # line used for trend_per_step), and its standard error. These were previously never computed at
+        # all: the report printed `fut.get('trend_r2', 0)` / `fut.get('std_error', 0)` defaults for keys
+        # that simply did not exist, which looked like a genuine "R2 = 0" result rather than a missing value.
+        n_recent = len(recent)
+        if n_recent >= 3:
+            xs = np.arange(n_recent, dtype=float)
+            line = recent[0] + trend_per_step * xs
+            resid = np.asarray(recent) - line
+            ss_res = float(np.sum(resid ** 2))
+            ss_tot = float(np.sum((np.asarray(recent) - np.mean(recent)) ** 2))
+            trend_r2 = round(1 - ss_res / ss_tot, 4) if ss_tot > 1e-12 else None
+            std_error = round(float(np.std(resid, ddof=1)), 4) if n_recent > 2 else None
+        else:
+            trend_r2, std_error = None, None
+
         lag1 = f"{target_col}_lag1"
         lag3 = f"{target_col}_lag3"
         roll3 = f"{target_col}_roll3"
@@ -453,13 +483,19 @@ def _future_prediction(model, scaler, feature_cols, df_feat, target_col, steps=1
             pred = float(model.predict(row_scaled)[0])
             trend_adjusted = pred + trend_per_step * min(i, 3) * 0.25
             future_y.append(round(trend_adjusted, 4))
-            band = max(abs(trend_adjusted) * 0.05, recent_std * 0.5)
+            # Band widens with the forecast horizon (uncertainty compounds further out) instead of being a
+            # flat +/-5% of the point prediction at every step, which previously produced an identical band
+            # width for step 0 and step 9 and is not a genuine (let alone 95%) prediction interval.
+            horizon_factor = (1 + i) ** 0.5
+            se = std_error if std_error is not None else recent_std
+            band = max(abs(trend_adjusted) * 0.02, se * 1.0) * horizon_factor
             conf_upper.append(round(trend_adjusted + band, 4))
             conf_lower.append(round(trend_adjusted - band, 4))
             history.append(trend_adjusted)
 
         return {
             "available": True,
+            "target":          target_col,
             "future_y":        future_y,
             "future_upper":    conf_upper,
             "future_lower":    conf_lower,
@@ -469,6 +505,11 @@ def _future_prediction(model, scaler, feature_cols, df_feat, target_col, steps=1
             "future_steps":    steps,
             "trend_per_step":  round(trend_per_step, 4),
             "trend_direction": "up" if trend_per_step > 0 else "down",
+            "trend_r2":        trend_r2,
+            "std_error":       std_error,
+            # Explicitly documents that this is NOT a model-fit interval; it widens with horizon but is
+            # still a heuristic band around a point forecast, not a calibrated prediction interval.
+            "interval_note":   "Approximate band (grows with forecast horizon), not a calibrated prediction interval.",
         }
     except Exception as e:
         return {"available": False, "error": str(e)}
@@ -701,7 +742,7 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
     for name, clf in _get_models(task_type):
         try:
             clf.fit(X_train, y_train)
-            metrics = _eval_metrics(clf, X_train, X_test, y_train, y_test, task_type, n_classes)
+            metrics = _eval_metrics(clf, X_train, X_test, y_train, y_test, task_type, n_classes, det.get("is_timeseries", False))
             holdout = metrics.get(primary_metric)
             cvm = metrics.get("cv_score")
             if use_macro_selection:
