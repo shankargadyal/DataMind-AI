@@ -15,6 +15,4 @@ users.json
 apikey.txt
 .env
 README.md
-templates/src/
-templates/node_modules/
 templates/package-lock.json
