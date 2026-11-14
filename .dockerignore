@@ -1,3 +1,4 @@
+
 .venv/
 venv/
 node_modules/
@@ -15,4 +16,4 @@ users.json
 apikey.txt
 .env
 README.md
-templates/package-lock.json
+templates/node_modules/
