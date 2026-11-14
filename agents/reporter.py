@@ -180,6 +180,18 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
         body = f"The AI forecasted '{target}' forward using {best_model} ({score_str} on backtesting)."
         headline = f"Forecast ready for '{target}' — {best_model}"
         score_meaning = f"The backtest error ({score_str}) shows how far off the model's predictions were on recent known data — lower is more trustworthy."
+    elif task_type == "regression" and best_score <= 0:
+        # R2 <= 0 is no better than always predicting the mean -- the model has no real predictive skill,
+        # so the fallback text must not claim it "reliably" forecasts anything (this was previously
+        # unconditional and produced "...meaning it can reliably forecast future outcomes" even when the
+        # score was negative).
+        body = (
+            f"The predictive model achieved {score_str}, which is at or below zero — it does not predict "
+            f"'{target}' any better than always guessing the average value, so its forecasts should not be "
+            f"relied on."
+        )
+        headline = f"No reliable model found for '{target}' ({score_str})"
+        score_meaning = f"{score_str} means the model has no usable predictive skill for '{target}' on this data. Cross-validation: {cv_str}."
     else:
         body = f"The predictive model achieved {score_str}, meaning it can reliably forecast future outcomes."
         headline = f"Your data is ready — AI model achieves {score_str}"
