@@ -1339,6 +1339,7 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
         # BUG-12: pass safe_det, not raw det (which contains DataFrame)
         rep = reporter.run_reporter(safe_det, ana, ml, query, api_key, job_id=job_id, user_email=jobs[job_id].get("user"))
         degraded_mode = bool(ana.get("degraded_mode") or rep.get("degraded_mode"))
+        rep["degraded_mode"] = degraded_mode   # explicit on `rep` so downstream consumers (evaluator, report PDF) don't need to re-derive it from `ana`
         if degraded_mode:
             log(job_id, "[WARN] AI fallback mode active - Groq response unavailable")
 
@@ -1421,6 +1422,7 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
                 "confusion_matrix":    confusion_matrix,
                 "confusion_labels":    confusion_labels,
                 "class_imbalance":     ml_safe.get("class_imbalance", {}),
+                "data_relationships":  ml_safe.get("data_relationships", {}),
                 "feature_importances": ml_safe.get("feature_importances", []),
                 "shap_plots":          ml_safe.get("shap_plots", {"available": False}),
                 "engineered_features": ml_safe.get("engineered_features", []),
