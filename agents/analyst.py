@@ -148,43 +148,65 @@ def run_analyst(det: dict, query: str, api_key: str, job_id: str = None, user_em
     prompt_template = _EDA_PROMPT if exploratory else _INSIGHT_PROMPT
     prompt = prompt_template.format(profile=profile, query=query)
 
+    # Deterministic, evidence-grounded fallback when the language model is unavailable.
+    shape = det.get("original_shape") or [0, 0]
+    row_count, col_count = (list(shape) + [0, 0])[:2]
+    col_stats = det.get("column_stats") or {}
+    numeric = det.get("numeric_cols") or []
+    categorical = det.get("categorical_cols") or []
+    quality = det.get("quality_score", 0)
+    evidence = [{"title": "Dataset profile", "description":
+                 f"The uploaded dataset contains {row_count} records and {col_count} columns "
+                 f"({len(numeric)} numeric, {len(categorical)} categorical).",
+                 "type": "info", "impact": "medium"}]
+    missing = [(name, st.get("missing", 0)) for name, st in col_stats.items()
+               if isinstance(st, dict) and isinstance(st.get("missing", 0), (int, float)) and st.get("missing", 0) > 0]
+    if missing:
+        name, count = max(missing, key=lambda pair: pair[1])
+        evidence.append({"title": "Missing data detected", "description":
+                         f"Column '{name}' has {int(count)} missing values. Review the cleaning log and check whether missingness is systematic.",
+                         "type": "warning", "impact": "high"})
+    else:
+        evidence.append({"title": "No missing values reported", "description":
+                         "The profiler did not report missing values in its column statistics. This does not rule out invalid or mislabeled data.",
+                         "type": "info", "impact": "low"})
+    for name in numeric[:2]:
+        st = col_stats.get(name) or {}
+        lo, hi = st.get("min"), st.get("max")
+        if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+            evidence.append({"title": f"Range of {name}", "description":
+                             f"Observed {name} values range from {lo:g} to {hi:g}. Investigate extreme or unexpected values before relying on the model.",
+                             "type": "info", "impact": "medium"})
+    if row_count < 100:
+        evidence.append({"title": "Small dataset", "description":
+                         f"Only {row_count} rows were supplied. Predictive evaluation may be unstable; gather more representative observations.",
+                         "type": "warning", "impact": "high"})
     fallback = {
-        "key_insights": [
-            {
-                "title": "Data Loaded Successfully",
-                "description": "Your dataset has been cleaned and is ready for analysis.",
-                "type": "positive",
-                "impact": "high",
-            }
-        ],
+        "key_insights": evidence,
         "ml_recommendation": {
-            "target_column": suggested_target or (det.get("numeric_cols", [""])[0] if det.get("numeric_cols") else ""),
+            "target_column": suggested_target or (numeric[0] if numeric else ""),
             "task_type": "exploratory" if exploratory else fallback_task,
-            "reason": "Auto-selected from available columns",
-            "business_value": "Identify key drivers and forecast future values",
+            "reason": "Auto-selected from available columns; confirm that this target matches your goal",
+            "business_value": "Explore associations; prediction requires validation",
         },
         "actions": [
-            {"priority": 1, "action": "Review the data quality score", "expected_outcome": "Better predictions"}
+            {"priority": 1, "action": "Verify the selected prediction target and column meanings", "expected_outcome": "Avoid modeling the wrong outcome"},
+            {"priority": 2, "action": "Review missing, invalid, and unusual values", "expected_outcome": "Understand potential data-quality limitations"},
+            {"priority": 3, "action": "Validate results on additional representative records", "expected_outcome": "Assess generalization beyond this dataset"},
         ],
-        "dataset_summary": (
-            f"Dataset with {det.get('original_shape', [0, 0])[0]} rows "
-            f"and {det.get('original_shape', [0, 0])[1]} columns."
-        ),
-        "data_health": "good",
+        "dataset_summary": (f"Dataset contains {row_count} rows and {col_count} columns. "
+                            "The language model was unavailable, so these are deterministic profile observations, not AI-inferred business findings."),
+        "data_health": "good" if quality >= 85 else ("fair" if quality >= 65 else "poor"),
         "domain": "other",
-        "warning_flags": [],
+        "warning_flags": ([{"message": f"Small dataset: {row_count} rows; evaluation may be unstable.", "severity": "warning", "column": ""}] if row_count < 100 else []),
         "metric_cards": [
-            {
-                "label": "Data Quality",
-                "value": f"{det.get('quality_score', 0)}%",
-                "meaning": "How complete and reliable your data is",
-                "trend": "up" if det.get("quality_score", 0) > 80 else "down",
-            }
+            {"label": "Data Quality", "value": f"{quality}%", "meaning": "Profiler quality score; not a model accuracy score", "trend": "neutral"},
+            {"label": "Rows", "value": str(row_count), "meaning": "Observations in the uploaded dataset", "trend": "neutral"},
         ],
         "query_suggestions": [
-            "What are the most important patterns in this data?",
-            "Which columns have the most missing values?",
-            "What should I focus on to improve results?",
+            "Which columns have missing values?",
+            "What are the observed ranges of the numeric columns?",
+            "What additional data is needed to validate the model?",
         ],
         "generated_by": "fallback",
         "degraded_mode": True,
