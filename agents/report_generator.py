@@ -49,14 +49,14 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
                             leftMargin=2*cm, rightMargin=2*cm,
                             topMargin=2*cm, bottomMargin=2*cm)
 
-    C_PRIMARY = colors.HexColor("#7C6FF7")
-    C_SUCCESS = colors.HexColor("#00C896")
-    C_WARNING = colors.HexColor("#F5A623")
+    C_PRIMARY = colors.HexColor("#A85E08")
+    C_SUCCESS = colors.HexColor("#188252")
+    C_WARNING = colors.HexColor("#B66A10")
     C_DANGER  = colors.HexColor("#F04444")
-    C_DARK    = colors.HexColor("#1E293B")
+    C_DARK    = colors.HexColor("#29231E")
     C_GRAY    = colors.HexColor("#64748B")
     C_LIGHT   = colors.HexColor("#E2E8F0")
-    C_BG      = colors.HexColor("#F8FAFC")
+    C_BG      = colors.HexColor("#F7F5F1")
 
     base = getSampleStyleSheet()["Normal"]
 
@@ -149,9 +149,10 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
             sty["small"]
         ))
     summary = analysis_data.get("summary", "Analysis complete.")
+    from xml.sax.saxutils import escape as xml_escape
     for para in (summary.split("\n\n") if "\n\n" in summary else [summary]):
         if para.strip():
-            story.append(Paragraph(para.strip(), sty["body"]))
+            story.append(Paragraph(xml_escape(para.strip()), sty["body"]))
 
     # AI Agent Contributions — makes the multi-agent architecture visible
     # to the reader instead of leaving it implicit behind one summary.
@@ -169,7 +170,7 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
         ("Data Detective Agent", detective_desc),
         ("Analytics Agent", f"Generated {n_insights} data-driven insight(s) from statistical patterns and correlations."),
         ("ML Engineer Agent", f"Trained and compared multiple models — selected {best_model} as best performer."),
-        ("Explainability Agent", "Produced SHAP-based global and local explanations for model decisions."),
+        ("Explainability Agent", "Generated model explanations where supported; availability is detailed below."),
         ("Reporter Agent", f"Synthesized findings into {n_actions} recommended action(s) and this executive report."),
     ]
     if eval_result and eval_result.get("status") not in (None, "NOT_EVALUATED"):
@@ -254,6 +255,9 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
             f"Metric: <b>{metric_label}</b>",
             sty["body"]
         ))
+        story.append(Paragraph(
+            "The selected model may not have the highest displayed hold-out score because model selection can use cross-validation "
+            "or imbalance-aware metrics. Hold-out scores shown below are evaluation results, not selection guarantees.", sty["small"]))
         story.append(Spacer(1, 6))
 
         # Main scores
@@ -286,7 +290,7 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
         for ri, m in enumerate(models, 1):
             if m.get("is_best"):
                 ms += [
-                    ("BACKGROUND", (0,ri), (-1,ri), colors.HexColor("#EDE9FF")),
+                    ("BACKGROUND", (0,ri), (-1,ri), colors.HexColor("#F3E7D5")),
                     ("TEXTCOLOR",  (2,ri), (2,ri),  C_PRIMARY),
                     ("FONTNAME",   (2,ri), (2,ri),  "Helvetica-Bold"),
                 ]
@@ -341,43 +345,31 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
                 story.append(Paragraph(f"... and {len(_rel_lines) - 8} more.", sty["small"]))
             story.append(Spacer(1, 8))
 
-        # Prediction Confidence Summary — confidence score, risk level, and a
-        # plain-English reason, applied at the model level (per-row prediction
-        # confidence isn't retained past the pipeline run, so this summarizes
-        # the model's overall prediction reliability the same way).
+        # Model reliability: scores are evaluation metrics, never confidence percentages.
         best_score_val = ml.get("best_score", 0) or 0
-        top_feats = [f.get("feature", f.get("name", "")) for f in (ml.get("feature_importances", []) or [])[:3] if isinstance(f, dict)]
-        story.append(Paragraph("Prediction Confidence Summary", sty["h1"]))
-        if task == "regression" and best_score_val <= 0:
-            # R2 <= 0 means "no better than predicting the mean" -- there is no meaningful confidence
-            # percentage or risk LEVEL to show (a negative "confidence" and a risk-level label next to
-            # it previously implied a real-but-poor model, when in fact the model has no skill at all).
+        story.append(Paragraph("Model Reliability &amp; Limitations", sty["h1"]))
+        if task == "regression":
+            if best_score_val <= 0:
+                msg = "Hold-out R² is at or below zero: the model has not demonstrated predictive skill beyond a mean baseline."
+            elif best_score_val < 0.5:
+                msg = "Hold-out R² is below 0.5: the model explains limited variation in evaluation data. Treat predictions as exploratory."
+            else:
+                msg = "R² measures explained variance on the evaluation data, not confidence in any individual prediction."
+            story.append(Paragraph(f"Hold-out R²: <b>{best_score_val:.4f}</b>. {msg}", sty["body"]))
+        elif task == "classification":
             story.append(Paragraph(
-                f"<font color='{C_DANGER.hexval()}'><b>No reliable predictive signal</b></font>  ·  "
-                f"R² = <b>{round(best_score_val, 4)}</b> on the hold-out set",
-                sty["body"]
-            ))
-            story.append(Paragraph(
-                "An R² at or below zero means the model performs no better than always predicting the average "
-                "value. Do not treat its forecasts or feature rankings below as reliable; they reflect what a "
-                "model with no real predictive skill happened to fit, not a genuine pattern in the data.",
-                sty["small"]
-            ))
+                f"Reported hold-out accuracy: <b>{best_score_val:.3f}</b>. Accuracy is not a calibrated probability of correctness; "
+                "review class balance, macro F1 and the confusion matrix.", sty["body"]))
         else:
-            conf_pct = round(best_score_val * 100, 1) if best_score_val <= 1 else round(best_score_val, 1)
-            risk_level = "Low" if conf_pct >= 80 else ("Medium" if conf_pct >= 60 else "High")
-            risk_color = C_SUCCESS if risk_level == "Low" else (C_WARNING if risk_level == "Medium" else C_DANGER)
-            reason = (
-                f"Prediction quality is primarily driven by {', '.join(top_feats)}."
-                if top_feats else
-                f"Based on {ml.get('best_model','the selected model')}'s cross-validated performance on this dataset."
-            )
+            story.append(Paragraph("Reported model scores describe the evaluation protocol, not per-prediction certainty.", sty["body"]))
+        rows_count = stats.get("total_rows", 0) or 0
+        if rows_count < 100:
             story.append(Paragraph(
-                f"Confidence: <b>{conf_pct}%</b>  ·  "
-                f"<font color='{risk_color.hexval()}'>Risk Level: <b>{risk_level}</b></font>",
-                sty["body"]
-            ))
-            story.append(Paragraph(reason, sty["small"]))
+                f"Small-sample warning: only {rows_count} rows were analyzed. Scores and feature rankings may be unstable; "
+                "collect more representative observations and validate on unseen data.", sty["small"]))
+        story.append(Paragraph(
+            "Feature importance is global and associative; it does not establish causation or explain an arbitrary user's prediction.",
+            sty["small"]))
         story.append(Spacer(1, 8))
 
         # Confusion matrix
@@ -417,7 +409,7 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
     shap_available = bool(shap_plots.get("available"))
     if fi:
         story.append(Paragraph(
-            f"Top Feature Importances {'(SHAP)' if shap_available else '(Native)'}",
+            f"Top Feature Importances {'(SHAP)' if shap_available else '(Model-based)'}",
             sty["h1"]
         ))
         fi_data = [["Rank", "Feature", "Importance Score"]]
@@ -645,18 +637,16 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
     score_pct_final = round(best_score_final * 100, 1) if best_score_final <= 1 else round(best_score_final, 1)
 
     model_has_no_skill = task == "regression" and best_score_final <= 0
+    model_is_weak = task == "regression" and best_score_final < 0.5
+    small_sample = (stats.get("total_rows", 0) or 0) < 100
     if model_has_no_skill:
-        # risk_score_final is a data-QUALITY-based score and knows nothing about model performance, so it
-        # can read "low risk" even when the model itself has no predictive skill (R2 <= 0). Previously the
-        # readiness wording and "strongest performance (-9.4%)" phrasing never checked this, producing a
-        # "reasonably production-ready" verdict for a model that predicts no better than the average.
-        readiness = "not production-ready — the best model has no demonstrated predictive skill (R² ≤ 0); the risk score above only reflects data quality, not model performance"
-    elif risk_score_final >= 60:
-        readiness = "not yet production-ready — the elevated risk score above should be resolved first"
+        readiness = "not validated for production — the regression model has not demonstrated predictive skill"
+    elif model_is_weak or small_sample:
+        readiness = "exploratory only — limited model fit or small sample size requires further validation"
     elif risk_score_final >= 30 or (quality_score_final is not None and quality_score_final < 70):
-        readiness = "usable with caution — review the flagged risks and quality gaps before relying on it for decisions"
+        readiness = "provisional — resolve quality and evaluation risks before operational use"
     else:
-        readiness = "reasonably production-ready, pending normal validation"
+        readiness = "not yet production-validated — independent evaluation and domain review remain necessary"
 
     eval_note = ""
     if eval_result and eval_result.get("status") == "FLAGGED":
@@ -664,10 +654,12 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
     elif eval_result and eval_result.get("status") == "FAILED":
         eval_note = " Note: the automated Guardrails check failed completeness validation on this report — treat conclusions as provisional pending human review."
 
-    if model_has_no_skill:
-        perf_clause = f"while {best_model_final} was the least-bad model compared, it achieved R² = {round(best_score_final,4)} (no real predictive skill)"
+    if task == "regression":
+        perf_clause = f"and the selected {best_model_final} model achieved hold-out R² = {best_score_final:.4f}"
+    elif task == "classification":
+        perf_clause = f"and the selected {best_model_final} model achieved hold-out accuracy = {best_score_final:.3f}"
     else:
-        perf_clause = f"with {best_model_final} achieving the strongest performance ({score_pct_final}%) among the models compared"
+        perf_clause = f"and the selected model was {best_model_final} (reported score {best_score_final:.4f})"
 
     story.append(Paragraph(
         f"This dataset scored {quality_score_final if quality_score_final is not None else 'N/A'}/100 on data quality, "
@@ -683,8 +675,8 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
     story.append(HRFlowable(width="100%", thickness=1, color=C_LIGHT))
     story.append(Spacer(1, 8))
     story.append(Paragraph(
-        f"Generated by DataMind AI v3.0  ·  {datetime.now().strftime('%Y-%m-%d %H:%M')}  ·  "
-        "Predictions are probabilistic. Validate before production use.",
+        f"Generated by DataMind AI v3.1  ·  {datetime.now().strftime('%Y-%m-%d %H:%M')}  ·  "
+        "Predictions are estimates, not guarantees. Validate before production use.",
         sty["footer"]
     ))
 
