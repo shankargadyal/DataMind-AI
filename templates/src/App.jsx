@@ -1105,88 +1105,116 @@ function MLResultsPage({ jobResult, setPage }) {
 
 // ─── PREDICT PAGE ─────────────────────────────────────────────────
 function PredictPage({ token, jobId, setPage }) {
-  const [feats, setFeats]     = useState([]);
-  const [inputs, setInputs]   = useState({});
-  const [taskType, setTask]   = useState("");
-  const [target, setTarget]   = useState("");
-  const [result, setResult]   = useState(null);
+  const [feats, setFeats] = useState([]);
+  const [inputs, setInputs] = useState({});
+  const [taskType, setTask] = useState("");
+  const [target, setTarget] = useState("");
+  const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
-  const [err, setErr]         = useState("");
-  const [ready, setReady]     = useState(false);
+  const [err, setErr] = useState("");
+  const [ready, setReady] = useState(false);
+  const [showAll, setShowAll] = useState(false);
+  const [history, setHistory] = useState([]);
 
   useEffect(() => {
+    setReady(false); setFeats([]); setInputs({}); setResult(null); setHistory([]); setErr("");
     if (!jobId) return;
+    let cancelled = false;
     apiFetch(`/api/predict_info/${jobId}`, {}, token)
-      .then(r => r.json()).then(d => {
-        if (d.features) {
-          setFeats(d.features); setTask(d.task_type); setTarget(d.target);
-          const def = {}; d.features.forEach(f => { def[f.name] = f.mean?.toFixed(3) ?? "0"; });
-          setInputs(def); setReady(true);
-        }
-      }).catch(() => setErr("Could not load predict_info — job may not have a trained model"));
+      .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.error || "Could not load model information"); return d; })
+      .then(d => {
+        if (cancelled) return;
+        if (!Array.isArray(d.features) || !d.features.length) throw new Error("No prediction features available");
+        setFeats(d.features); setTask(d.task_type || ""); setTarget(d.target || "");
+        const defaults = {};
+        d.features.forEach(f => { defaults[f.name] = Number.isFinite(Number(f.mean)) && f.mean != null ? String(Number(f.mean.toFixed(3))) : ""; });
+        setInputs(defaults); setReady(true);
+      })
+      .catch(e => { if (!cancelled) setErr(e.message || "Could not load prediction inputs"); });
+    return () => { cancelled = true; };
   }, [jobId, token]);
 
+  const invalid = feats.filter(f => {
+    const raw = String(inputs[f.name] ?? "").trim();
+    const n = Number(raw);
+    return !raw || !Number.isFinite(n) || (Number.isFinite(f.min) && n < f.min) || (Number.isFinite(f.max) && n > f.max);
+  });
+
   async function predict() {
-    setLoading(true); setErr(""); setResult(null);
+    if (!ready || loading) return;
+    if (invalid.length) { setErr(`Check these inputs: ${invalid.map(f => f.name).join(", ")}`); return; }
+    setLoading(true); setErr("");
     try {
-      const nums = {}; Object.keys(inputs).forEach(k => { nums[k] = parseFloat(inputs[k]) || 0; });
+      const nums = {};
+      feats.forEach(f => { nums[f.name] = Number(inputs[f.name]); });
       const r = await apiFetch(`/api/predict/${jobId}`, { method: "POST", body: JSON.stringify({ inputs: nums }) }, token);
       const d = await r.json();
-      if (!r.ok) { setErr(d.error); return; }
+      if (!r.ok) throw new Error(d.error || "Prediction failed");
       setResult(d);
-    } catch { setErr("Prediction request failed"); }
+      setHistory(h => [{ prediction: d.prediction, confidence: d.confidence, inputs: { ...nums }, time: new Date().toLocaleTimeString() }, ...h].slice(0, 5));
+    } catch (e) { setErr(e.message || "Prediction request failed"); }
     finally { setLoading(false); }
   }
+
+  const label = result?.prediction_label ?? result?.label ?? result?.class_label ?? null;
+  const confidence = result?.confidence == null ? null : Number(result.confidence);
+  const confidencePct = Number.isFinite(confidence) ? Math.max(0, Math.min(100, confidence <= 1 ? confidence * 100 : confidence)) : null;
+  const displayed = showAll ? feats : feats.slice(0, 8);
+  const pretty = name => String(name).replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
 
   if (!jobId) return <Empty icon="🎯" title="No model trained" sub="Upload and analyse a dataset first" action="⬆ Upload" onAction={() => setPage("upload")} />;
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 16, animation: "fadeIn .2s ease" }}>
-      <div className="card" style={{ padding: 16 }}>
-        <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>Make a Prediction</div>
-        {target && <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 16 }}>Predicting: <span style={{ color: "var(--accent)", fontWeight: 500 }}>{target}</span> · Task: {taskType}</div>}
-        {!ready && !err && <div style={{ display: "flex", alignItems: "center", gap: 8, color: "var(--text3)", fontSize: 12, padding: "12px 0" }}><Spinner />Loading feature inputs...</div>}
-        {feats.length > 0 && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 10, marginBottom: 14 }}>
-            {feats.slice(0, 12).map(f => (
-              <div key={f.name}>
-                <label style={{ fontSize: 11, color: "var(--text3)", display: "block", marginBottom: 3 }}>
-                  {f.name} <span style={{ fontSize: 10, opacity: .7 }}>({f.min?.toFixed(1)} – {f.max?.toFixed(1)})</span>
-                </label>
-                <input className="input" type="number" step="any"
-                  value={inputs[f.name] ?? ""}
-                  onChange={e => setInputs(p => ({ ...p, [f.name]: e.target.value }))}
-                  placeholder={f.mean?.toFixed(3)} />
-              </div>
-            ))}
+    <div style={{ display: "flex", flexDirection: "column", gap: 16, animation: "fadeIn .25s ease", maxWidth: 1440, margin: "0 auto", width: "100%" }}>
+      <div className="card" style={{ padding: "22px 24px", background: "linear-gradient(120deg,var(--bg3),var(--bg2))" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ color: "var(--accent)", fontSize: 11, letterSpacing: ".12em", fontWeight: 700, marginBottom: 7 }}>DATAMIND / PREDICTION STUDIO</div>
+            <h2 style={{ fontSize: 25, marginBottom: 5 }}>Make data-driven predictions</h2>
+            <p style={{ color: "var(--text2)", fontSize: 12 }}>Use the trained model to explore outcomes for new observations.</p>
           </div>
-        )}
-        {err && <div style={{ fontSize: 12, color: "var(--danger)", background: "var(--danger-bg)", padding: "8px 12px", borderRadius: 6, marginBottom: 10 }}>{err}</div>}
-        {ready && (
-          <button className="btn-primary" onClick={predict} disabled={loading}>
-            {loading ? <Spinner size={13} /> : "🎯"} {loading ? "Predicting..." : "Run Prediction"}
-          </button>
-        )}
+          <Badge type={ready ? "green" : "yellow"}>{ready ? "● Model ready" : "Model loading"}</Badge>
+        </div>
+        {ready && <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 17 }}>
+          <Badge>{taskType || "Prediction"}</Badge><Badge type="gray">Target: {target || "Unknown"}</Badge><Badge type="gray">{feats.length} features</Badge>
+        </div>}
       </div>
 
-      {result && (
-        <div className="card" style={{ padding: 16, borderLeft: "3px solid var(--accent)", animation: "fadeIn .3s ease" }}>
-          <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 4 }}>Prediction Result</div>
-          <div style={{ fontSize: 32, fontWeight: 700, color: "var(--accent)", letterSpacing: "-1px", marginBottom: 10 }}>{String(result.prediction)}</div>
-          {result.confidence != null && (
-            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
-              <div style={{ fontSize: 12, color: "var(--text2)", flexShrink: 0 }}>Confidence</div>
-              <div style={{ flex: 1, background: "var(--bg3)", borderRadius: 99, height: 7, overflow: "hidden" }}>
-                <div style={{ width: `${result.confidence}%`, height: "100%", borderRadius: 99, background: result.confidence > 80 ? "var(--success)" : result.confidence > 60 ? "var(--warning)" : "var(--danger)" }} />
-              </div>
-              <div style={{ fontSize: 12, fontWeight: 600, flexShrink: 0 }}>{result.confidence}%</div>
-            </div>
-          )}
-          <div style={{ fontSize: 11, color: "var(--text3)" }}>
-            Task: {result.task_type} · Features used: {result.features_used}
-          </div>
+      <div className="card" style={{ padding: "22px 24px" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 18 }}>
+          <div><h3 style={{ fontSize: 16 }}>Input features</h3><p style={{ fontSize: 11, color: "var(--text3)", marginTop: 3 }}>Values are initialized from the training feature averages, when available.</p></div>
+          {ready && <button className="btn-ghost" onClick={() => { const defaults = {}; feats.forEach(f => { defaults[f.name] = f.mean != null && Number.isFinite(Number(f.mean)) ? String(Number(f.mean.toFixed(3))) : ""; }); setInputs(defaults); setResult(null); setErr(""); }}>↺ Reset values</button>}
         </div>
-      )}
+        {!ready && !err && <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "18px 0", color: "var(--text2)" }}><Spinner /> Loading model metadata…</div>}
+        {ready && <>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(min(100%,280px),1fr))", gap: 16 }}>
+            {displayed.map(f => {
+              const n = Number(inputs[f.name]);
+              const bad = !String(inputs[f.name] ?? "").trim() || !Number.isFinite(n) || (Number.isFinite(f.min) && n < f.min) || (Number.isFinite(f.max) && n > f.max);
+              return <label key={f.name} style={{ display: "block" }}>
+                <span style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 7, fontSize: 12, fontWeight: 600 }}><span>{pretty(f.name)}</span><span className="mono" style={{ fontSize: 10, fontWeight: 400, color: "var(--text3)" }}>{Number.isFinite(f.min) && Number.isFinite(f.max) ? `${f.min.toFixed(1)} – ${f.max.toFixed(1)}` : "Numeric"}</span></span>
+                <input className="input" type="number" step="any" min={Number.isFinite(f.min) ? f.min : undefined} max={Number.isFinite(f.max) ? f.max : undefined} value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad} />
+              </label>;
+            })}
+          </div>
+          {feats.length > 8 && <button className="btn-ghost" style={{ marginTop: 16 }} onClick={() => setShowAll(v => !v)}>{showAll ? "Show fewer features" : `Show all ${feats.length} features`}</button>}
+          <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 22, flexWrap: "wrap" }}>
+            <button className="btn-primary" onClick={predict} disabled={loading || invalid.length > 0} style={{ padding: "12px 20px" }}>{loading ? <Spinner size={13} /> : "✦"} {loading ? "Running prediction…" : "Run prediction"}</button>
+            <span style={{ color: invalid.length ? "var(--danger)" : "var(--text3)", fontSize: 11 }}>{invalid.length ? `${invalid.length} field(s) need valid values` : "All feature values valid"}</span>
+          </div>
+        </>}
+        {err && <div role="alert" style={{ marginTop: 14, fontSize: 12, color: "var(--danger)", background: "var(--danger-bg)", padding: 12, borderRadius: 9 }}>{err}</div>}
+      </div>
+
+      {result && <div className="card" style={{ padding: "22px 24px", borderLeft: "3px solid var(--accent)", animation: "fadeIn .3s ease" }}>
+        <div style={{ fontSize: 11, color: "var(--text3)", textTransform: "uppercase", letterSpacing: ".08em", marginBottom: 10 }}>Prediction result</div>
+        <div style={{ fontSize: 32, fontWeight: 700, color: "var(--accent)", letterSpacing: "-.03em" }}>{label != null ? String(label) : String(result.prediction)}</div>
+        {label != null && <div style={{ color: "var(--text3)", fontSize: 11, marginTop: 4 }}>Raw model output: {String(result.prediction)}</div>}
+        {confidencePct != null && <div style={{ marginTop: 20 }}><div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 8 }}><span>Model confidence for predicted class</span><b className="mono">{confidencePct.toFixed(1)}%</b></div><div style={{ height: 9, borderRadius: 30, background: "var(--border)", overflow: "hidden" }}><div style={{ height: "100%", width: `${confidencePct}%`, background: "var(--accent)", borderRadius: 30, transition: "width .5s ease" }} /></div></div>}
+        <div style={{ marginTop: 15, color: "var(--text3)", fontSize: 11 }}>Task: {result.task_type || taskType} · Features used: {result.features_used ?? feats.length}</div>
+        <p style={{ marginTop: 9, color: "var(--text3)", fontSize: 11 }}>Model confidence is not a guarantee of correctness. Class names and explanations require metadata from the backend.</p>
+      </div>}
+      {history.length > 0 && <div className="card" style={{ padding: "20px 24px" }}><h3 style={{ fontSize: 15, marginBottom: 12 }}>Recent predictions <span style={{ color: "var(--text3)", fontSize: 11, fontWeight: 400 }}>(this session)</span></h3>{history.map((h, i) => <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderTop: "1px solid var(--border)", gap: 10, fontSize: 12 }}><span style={{ color: "var(--text2)" }}>{h.time}</span><b>{String(h.prediction)}</b><button className="btn-ghost" style={{ padding: "4px 9px", fontSize: 11 }} onClick={() => { setInputs(Object.fromEntries(Object.entries(h.inputs).map(([k,v]) => [k,String(v)]))); setResult(null); }}>Reuse inputs</button></div>)}</div>}
     </div>
   );
 }
