@@ -98,6 +98,7 @@ def _engineer_features(df: pd.DataFrame, det: dict) -> tuple:
     numeric_cols = det.get("numeric_cols", [])
     categorical_cols = det.get("categorical_cols", [])
     engineered = {}
+    categorical_mappings = {}
 
     # Date extraction
     for col in date_cols:
@@ -113,6 +114,7 @@ def _engineer_features(df: pd.DataFrame, det: dict) -> tuple:
         if col in df.columns:
             le = LabelEncoder()
             df[col] = le.fit_transform(df[col].astype(str))
+            categorical_mappings[col] = [str(v) for v in le.classes_]
 
     # Drop raw date columns
     for col in date_cols:
@@ -129,7 +131,7 @@ def _engineer_features(df: pd.DataFrame, det: dict) -> tuple:
                 engineered[f"rolling_{col}"] = ["roll3", "lag1", "lag3"]
 
     feature_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    return df, feature_cols, engineered
+    return df, feature_cols, engineered, categorical_mappings
 
 
 def _add_polynomial_features(X_train, X_test, feature_cols, top_n=5):
@@ -588,7 +590,7 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
         return {"error": "No valid target column", "models": []}
 
     # Feature engineering
-    df_feat, feature_cols, engineered = _engineer_features(df, det)
+    df_feat, feature_cols, engineered, categorical_mappings = _engineer_features(df, det)
     if target_col in feature_cols:
         feature_cols.remove(target_col)
     if not feature_cols:
@@ -817,4 +819,5 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
         "_feature_cols": feature_cols,
         "_le_target":    le_target,
         "_numeric_cols": det.get("numeric_cols", []),
+        "_categorical_mappings": categorical_mappings,
     }
