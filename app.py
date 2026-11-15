@@ -1589,6 +1589,7 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
                 "total_rows":     int(det["original_shape"][0]),
                 "total_cols":     int(det["original_shape"][1]),
                 "quality_score":  float(det.get("quality_score", 0)),
+                "composite_quality_score": (det.get("quality_dimensions") or {}).get("composite_score", det.get("quality_score", 0)),
                 "insights_count": len(ana.get("key_insights", [])),
                 "missing_fixed":  ctx_safe.get("missing_values_fixed", {}),
                 "missing_original": ctx_safe.get("missing_original", {}),
