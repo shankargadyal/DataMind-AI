@@ -1127,7 +1127,7 @@ function PredictPage({ token, jobId, setPage }) {
         if (!Array.isArray(d.features) || !d.features.length) throw new Error("No prediction features available");
         setFeats(d.features); setTask(d.task_type || ""); setTarget(d.target || "");
         const defaults = {};
-        d.features.forEach(f => { defaults[f.name] = Number.isFinite(Number(f.mean)) && f.mean != null ? String(Number(f.mean.toFixed(3))) : ""; });
+        d.features.forEach(f => { defaults[f.name] = f.input_type === "categorical" ? (f.options?.[0] ?? "") : Number.isFinite(Number(f.mean)) && f.mean != null ? String(Number(Number(f.mean).toFixed(3))) : ""; });
         setInputs(defaults); setReady(true);
       })
       .catch(e => { if (!cancelled) setErr(e.message || "Could not load prediction inputs"); });
@@ -1136,6 +1136,7 @@ function PredictPage({ token, jobId, setPage }) {
 
   const invalid = feats.filter(f => {
     const raw = String(inputs[f.name] ?? "").trim();
+    if (f.input_type === "categorical") return !f.options?.includes(raw);
     const n = Number(raw);
     return !raw || !Number.isFinite(n) || (Number.isFinite(f.min) && n < f.min) || (Number.isFinite(f.max) && n > f.max);
   });
@@ -1146,7 +1147,7 @@ function PredictPage({ token, jobId, setPage }) {
     setLoading(true); setErr("");
     try {
       const nums = {};
-      feats.forEach(f => { nums[f.name] = Number(inputs[f.name]); });
+      feats.forEach(f => { nums[f.name] = f.input_type === "categorical" ? inputs[f.name] : Number(inputs[f.name]); });
       const r = await apiFetch(`/api/predict/${jobId}`, { method: "POST", body: JSON.stringify({ inputs: nums }) }, token);
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || "Prediction failed");
@@ -1183,17 +1184,17 @@ function PredictPage({ token, jobId, setPage }) {
       <div className="card" style={{ padding: "22px 24px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 18 }}>
           <div><h3 style={{ fontSize: 16 }}>Input features</h3><p style={{ fontSize: 11, color: "var(--text3)", marginTop: 3 }}>Values are initialized from the training feature averages, when available.</p></div>
-          {ready && <button className="btn-ghost" onClick={() => { const defaults = {}; feats.forEach(f => { defaults[f.name] = f.mean != null && Number.isFinite(Number(f.mean)) ? String(Number(f.mean.toFixed(3))) : ""; }); setInputs(defaults); setResult(null); setErr(""); }}>↺ Reset values</button>}
+          {ready && <button className="btn-ghost" onClick={() => { const defaults = {}; feats.forEach(f => { defaults[f.name] = f.input_type === "categorical" ? (f.options?.[0] ?? "") : f.mean != null && Number.isFinite(Number(f.mean)) ? String(Number(Number(f.mean).toFixed(3))) : ""; }); setInputs(defaults); setResult(null); setErr(""); }}>↺ Reset values</button>}
         </div>
         {!ready && !err && <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "18px 0", color: "var(--text2)" }}><Spinner /> Loading model metadata…</div>}
         {ready && <>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(min(100%,280px),1fr))", gap: 16 }}>
             {displayed.map(f => {
               const n = Number(inputs[f.name]);
-              const bad = !String(inputs[f.name] ?? "").trim() || !Number.isFinite(n) || (Number.isFinite(f.min) && n < f.min) || (Number.isFinite(f.max) && n > f.max);
+              const bad = f.input_type === "categorical" ? !f.options?.includes(String(inputs[f.name] ?? "")) : (!String(inputs[f.name] ?? "").trim() || !Number.isFinite(n) || (Number.isFinite(f.min) && n < f.min) || (Number.isFinite(f.max) && n > f.max));
               return <label key={f.name} style={{ display: "block" }}>
-                <span style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 7, fontSize: 12, fontWeight: 600 }}><span>{pretty(f.name)}</span><span className="mono" style={{ fontSize: 10, fontWeight: 400, color: "var(--text3)" }}>{Number.isFinite(f.min) && Number.isFinite(f.max) ? `${f.min.toFixed(1)} – ${f.max.toFixed(1)}` : "Numeric"}</span></span>
-                <input className="input" type="number" step="any" min={Number.isFinite(f.min) ? f.min : undefined} max={Number.isFinite(f.max) ? f.max : undefined} value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad} />
+                <span style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 7, fontSize: 12, fontWeight: 600 }}><span>{pretty(f.name)}</span><span className="mono" style={{ fontSize: 10, fontWeight: 400, color: "var(--text3)" }}>{f.input_type === "categorical" ? "Category" : Number.isFinite(f.min) && Number.isFinite(f.max) ? `${f.min.toFixed(1)} – ${f.max.toFixed(1)}` : "Numeric"}</span></span>
+                {f.input_type === "categorical" ? <select className="input" value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad}>{(f.options || []).map(option => <option key={option} value={option}>{option}</option>)}</select> : <input className="input" type="number" step="any" min={Number.isFinite(f.min) ? f.min : undefined} max={Number.isFinite(f.max) ? f.max : undefined} value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad} />}
               </label>;
             })}
           </div>
