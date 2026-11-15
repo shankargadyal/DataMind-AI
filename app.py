@@ -740,7 +740,7 @@ def download_report(job_id):
         buf = io.BytesIO(pdf_bytes); buf.seek(0)
         safe = os.path.splitext(job.get("filename", "report"))[0]
         return send_file(buf, mimetype="application/pdf", as_attachment=True,
-                         download_name=f"DataMind_Report_{safe}.pdf")
+                         download_name=f"{secure_filename(safe) or 'dataset'}_DataMind_Report.pdf")
     except Exception as e:
         import traceback; traceback.print_exc()
         return jsonify({"error": f"PDF failed: {e}"}), 500
