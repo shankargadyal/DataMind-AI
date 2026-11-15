@@ -13,6 +13,7 @@ import os
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import LabelEncoder, StandardScaler, PolynomialFeatures
+from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.ensemble import (
     RandomForestClassifier, RandomForestRegressor,
@@ -93,45 +94,31 @@ def _select_target(df: pd.DataFrame, det: dict, requested: str) -> str | None:
 # ── Feature engineering ─────────────────────────────────────────────────────
 
 def _engineer_features(df: pd.DataFrame, det: dict) -> tuple:
-    df = df.copy()
-    date_cols = det.get("date_cols", [])
-    numeric_cols = det.get("numeric_cols", [])
-    categorical_cols = det.get("categorical_cols", [])
-    engineered = {}
+    """Create a predictable, one-row-safe tabular feature schema.
+
+    Date-derived and rolling/lag features are deliberately excluded from
+    interactive prediction: a single row has no historical context. Forecasting
+    uses its own dedicated agent and is unaffected by this change.
+    """
+    out = df.copy()
+    date_cols = set(det.get("date_cols", []) or [])
     categorical_mappings = {}
-
-    # Date extraction
-    for col in date_cols:
-        if col in df.columns and pd.api.types.is_datetime64_any_dtype(df[col]):
-            df[f"{col}_year"]  = df[col].dt.year
-            df[f"{col}_month"] = df[col].dt.month
-            df[f"{col}_day"]   = df[col].dt.day
-            df[f"{col}_dow"]   = df[col].dt.dayofweek
-            engineered[f"date_{col}"] = ["year", "month", "day", "dayofweek"]
-
-    # Label-encode categoricals
-    for col in categorical_cols:
-        if col in df.columns:
-            le = LabelEncoder()
-            df[col] = le.fit_transform(df[col].astype(str))
-            categorical_mappings[col] = [str(v) for v in le.classes_]
-
-    # Drop raw date columns
-    for col in date_cols:
-        if col in df.columns and not pd.api.types.is_numeric_dtype(df[col]):
-            df.drop(columns=[col], inplace=True)
-
-    # Rolling/lag for time-series
-    if det.get("is_timeseries") and numeric_cols:
-        for col in numeric_cols[:3]:
-            if col in df.columns:
-                df[f"{col}_roll3"] = df[col].rolling(3, min_periods=1).mean()
-                df[f"{col}_lag1"]  = df[col].shift(1).fillna(method="bfill")
-                df[f"{col}_lag3"]  = df[col].shift(3).fillna(method="bfill")
-                engineered[f"rolling_{col}"] = ["roll3", "lag1", "lag3"]
-
-    feature_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-    return df, feature_cols, engineered, categorical_mappings
+    engineered = {}
+    for col in out.columns:
+        if col in date_cols or pd.api.types.is_datetime64_any_dtype(out[col]):
+            continue
+        if pd.api.types.is_numeric_dtype(out[col]):
+            out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
+        else:
+            values = out[col].astype("string").fillna("(missing)").astype(str)
+            # Never allow a categorical feature to become a raw ordinal label
+            # without retaining its vocabulary for inference.
+            encoder = LabelEncoder()
+            out[col] = encoder.fit_transform(values)
+            categorical_mappings[col] = [str(v) for v in encoder.classes_]
+    feature_cols = [c for c in out.columns if c not in date_cols
+                    and pd.api.types.is_numeric_dtype(out[c])]
+    return out, feature_cols, engineered, categorical_mappings
 
 
 def _add_polynomial_features(X_train, X_test, feature_cols, top_n=5):
@@ -611,8 +598,9 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
     if isinstance(df_raw, pd.DataFrame) and target_col in df_raw.columns and len(df_raw) == len(df_feat):
         row_ok = df_raw[target_col].notna().values
         target_missing_dropped = int((~row_ok).sum())
-    X = df_feat.loc[row_ok, feature_cols].values
-    y_raw = (df_feat[target_col] if target_col in df_feat.columns else df[target_col]).values[row_ok]
+    X = df_feat.loc[row_ok, feature_cols].to_numpy(dtype=float)
+    # Use ORIGINAL target values; otherwise label encoding can scramble names.
+    y_raw = df.loc[row_ok, target_col].values
 
     detected_task = _detect_task(pd.Series(y_raw))
     analyst_task = (ml_rec.get("task_type") or "").strip().lower()
@@ -629,22 +617,10 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
     if task_type == "classification":
         le_target = LabelEncoder()
         y = le_target.fit_transform(pd.Series(y_raw).astype(str).values)
-        # Feature engineering label-encodes text targets, so le_target only knows "0","1",... here.
-        # Restore the ORIGINAL class names for display (codes/y are untouched), so confusion matrices
-        # and per-class output say "Churned"/"Retained" instead of "0"/"1".
-        try:
-            if target_col in df.columns and len(df) == len(df_feat) and not pd.api.types.is_numeric_dtype(df[target_col]):
-                pair = pd.DataFrame({"code": pd.Series(y_raw).astype(str).values,
-                                     "name": pd.Series(df[target_col].values[row_ok]).astype(str).values}).drop_duplicates()
-                if pair["code"].is_unique and pair["name"].is_unique:
-                    names = dict(zip(pair["code"], pair["name"]))
-                    le_target.classes_ = np.array([names[c] for c in le_target.classes_], dtype=object)
-        except Exception:
-            pass   # display-only nicety; never break training
     else:
-        y = y_raw.astype(float)
+        y = pd.to_numeric(pd.Series(y_raw), errors="coerce").to_numpy(dtype=float)
 
-    mask = ~np.isnan(y.astype(float)) if task_type == "regression" else np.ones(len(y), dtype=bool)
+    mask = np.isfinite(y) if task_type == "regression" else np.ones(len(y), dtype=bool)
     target_missing_dropped += int((~mask).sum())
     X, y = X[mask], y[mask]
     if len(X) < 20:
@@ -710,7 +686,10 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
                           f"({len(y_test):,} rows) is untouched; profiling, analysis and chat calculations use all rows.")
         eval_warnings.append(train_cap_note)
 
-    # Fit the scaler on the TRAINING split only (no test-set leakage).
+    # Median imputation is fitted ONLY on training data to avoid test leakage.
+    imputer = SimpleImputer(strategy="median", keep_empty_features=True)
+    X_train_raw = imputer.fit_transform(X_train_raw)
+    X_test_raw = imputer.transform(X_test_raw)
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train_raw)
     X_test = scaler.transform(X_test_raw)
@@ -816,6 +795,7 @@ def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str =
         # Private objects
         "_model_obj":    best_model_obj,
         "_scaler_obj":   scaler,
+        "_imputer_obj":  imputer,
         "_feature_cols": feature_cols,
         "_le_target":    le_target,
         "_numeric_cols": det.get("numeric_cols", []),
