@@ -218,6 +218,16 @@ const CSS = `
   .dm-login-inner{perspective:1200px;}
   @media (max-width:900px){.dm-laptop{transform:none;}}
   @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important;}}
+
+/* v3.2: consistent product-level surfaces, no decorative emoji dependency */
+.card { border-radius: 16px; box-shadow: 0 6px 28px rgba(49,37,25,.035); transition: box-shadow .2s ease, border-color .2s ease; }
+.card:hover { box-shadow: 0 9px 32px rgba(49,37,25,.06); }
+.nav-item { transition: background .16s ease, color .16s ease, transform .16s ease; }
+.nav-item:hover { transform: translateX(2px); }
+button { transition: transform .16s ease, box-shadow .16s ease, opacity .16s ease; }
+button:focus-visible, input:focus-visible, textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:not(:disabled):active { transform: translateY(1px); }
+@media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
 `;
 
 // ─── UTILS ────────────────────────────────────────────────────────
@@ -280,7 +290,7 @@ function KpiCard({ label, value, sub, highlight }) {
 function Empty({ icon, title, sub, action, onAction }) {
   return (
     <div style={{ textAlign: "center", padding: "48px 20px", color: "var(--text3)" }}>
-      <div style={{ fontSize: 38, marginBottom: 12 }}>{icon}</div>
+      <div style={{ fontSize: 38, marginBottom: 12 }}><Icon name={icon} size={30} /></div>
       <div style={{ fontSize: 14, fontWeight: 500, color: "var(--text2)", marginBottom: 6 }}>{title}</div>
       <div style={{ fontSize: 12, marginBottom: action ? 16 : 0 }}>{sub}</div>
       {action && <button className="btn-primary" onClick={onAction}>{action}</button>}
@@ -290,11 +300,11 @@ function Empty({ icon, title, sub, action, onAction }) {
 
 // ─── AGENT PIPELINE ───────────────────────────────────────────────
 const AGENTS = [
-  { id: "detective", label: "Data Detective",      desc: "Cleans, profiles & scores data quality", icon: "🔍", step: 1 },
-  { id: "analyst",    label: "AI Analyst",          desc: "LLaMA 3.3 70B insights",                  icon: "🧠", step: 2 },
-  { id: "ml",         label: "ML Engineer",         desc: "AutoML, clustering/forecasting, SHAP",    icon: "⚙️", step: 3 },
-  { id: "reporter",   label: "Reporter",            desc: "Executive summary & risk score",          icon: "📝", step: 4 },
-  { id: "dashboard",  label: "Dashboard & Industry",desc: "Builds visual dashboard + industry KPIs", icon: "📊", step: 5 },
+  { id: "detective", label: "Data Detective",      desc: "Cleans, profiles & scores data quality", icon: "search", step: 1 },
+  { id: "analyst",    label: "AI Analyst",          desc: "LLaMA 3.3 70B insights",                  icon: "analyst", step: 2 },
+  { id: "ml",         label: "ML Engineer",         desc: "AutoML, clustering/forecasting, SHAP",    icon: "ml", step: 3 },
+  { id: "reporter",   label: "Reporter",            desc: "Executive summary & risk score",          icon: "report", step: 4 },
+  { id: "dashboard",  label: "Dashboard & Industry",desc: "Builds visual dashboard + industry KPIs", icon: "charts", step: 5 },
 ];
 
 function fmtElapsed(sec) {
@@ -331,7 +341,7 @@ function AgentPipeline({ step, jobStatus, stepHistory = [] }) {
 
         const row = (
           <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "11px 13px", borderRadius: s === "running" ? "11.6px" : 13, background: s === "running" ? "transparent" : "var(--bg3)", border: s === "running" ? "none" : "1px solid var(--border)" }}>
-            <div style={{ width: 32, height: 32, borderRadius: 9, background: bg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, flexShrink: 0 }}>{ag.icon}</div>
+            <div style={{ width: 32, height: 32, borderRadius: 9, background: bg, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, flexShrink: 0 }}><Icon name={ag.icon} size={17}/></div>
             <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontSize: 12, fontWeight: 500 }}>{ag.label}</div>
               <div style={{ fontSize: 11, color: "var(--text3)" }}>{ag.desc}</div>
@@ -468,16 +478,40 @@ function AuthScreen({ onAuth }) {
 }
 
 // ─── SIDEBAR ─────────────────────────────────────────────────────
+
+// Crisp, dependency-free outline icons shared across every workspace page.
+const ICON_PATHS = {
+  dashboard: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
+  upload: <><path d="M12 16V3m0 0-5 5m5-5 5 5"/><path d="M4 16v4h16v-4"/></>,
+  insights: <><path d="M9 18h6m-5 3h4"/><path d="M9 14a7 7 0 1 1 6 0c-.8.6-1 1.6-1 3h-4c0-1.4-.2-2.4-1-3Z"/></>,
+  charts: <><path d="M4 20V10m6 10V4m6 16v-7m4 7H2"/></>,
+  ml: <><rect x="5" y="5" width="14" height="14" rx="3"/><path d="M9 9h6v6H9zM9 1v4m6-4v4M9 19v4m6-4v4M1 9h4m-4 6h4m14-6h4m-4 6h4"/></>,
+  predict: <><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></>,
+  chat: <path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5 9 9 0 0 1-4-.9L3 21l1.9-5.5a9 9 0 0 1-.9-4A8.5 8.5 0 0 1 12.5 3a8.5 8.5 0 0 1 8.5 8.5Z"/>,
+  report: <><path d="M6 2h9l4 4v16H6z"/><path d="M14 2v5h5M9 12h7M9 16h7"/></>,
+  history: <><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></>,
+  search: <><circle cx="10" cy="10" r="6"/><path d="m15 15 6 6"/></>,
+  analyst: <><path d="M12 2 9 9l-7 3 7 3 3 7 3-7 7-3-7-3z"/></>,
+  settings: <><circle cx="12" cy="12" r="3"/><path d="M12 2v3m0 14v3M2 12h3m14 0h3M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></>,
+  download: <><path d="M12 3v13m-5-5 5 5 5-5M4 18v3h16v-3"/></>,
+  folder: <path d="M3 6h7l2 3h9v11H3z"/>,
+  warning: <><path d="m12 3 10 18H2z"/><path d="M12 9v5m0 3v.1"/></>,
+  sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l2 2m10 10 2 2M19 5l-2 2M7 17l-2 2"/></>,
+  moon: <path d="M20 15.5A8.5 8.5 0 0 1 8.5 4 8.5 8.5 0 1 0 20 15.5Z"/>,
+};
+function Icon({ name = "dashboard", size = 17, style = {} }) {
+  return <svg aria-hidden="true" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" style={{flexShrink:0, verticalAlign:"middle", ...style}}>{ICON_PATHS[name] || ICON_PATHS.dashboard}</svg>;
+}
 const NAV = [
-  { id: "dashboard", icon: "🏠", label: "Dashboard" },
-  { id: "upload",    icon: "⬆️",  label: "Upload" },
-  { id: "insights",  icon: "💡",  label: "Insights" },
-  { id: "charts",    icon: "📊",  label: "Charts" },
-  { id: "ml",        icon: "🤖",  label: "ML Results" },
-  { id: "predict",   icon: "🎯",  label: "Predictions" },
-  { id: "chat",      icon: "💬",  label: "Chat" },
-  { id: "report",    icon: "📄",  label: "Reports" },
-  { id: "history",   icon: "📈",  label: "History" },
+  { id: "dashboard", icon: "charts", label: "Dashboard" },
+  { id: "upload",    icon: "upload",  label: "Upload" },
+  { id: "insights",  icon: "insights",  label: "Insights" },
+  { id: "charts",    icon: "charts",  label: "Charts" },
+  { id: "ml",        icon: "ml",  label: "ML Results" },
+  { id: "predict",   icon: "predict",  label: "Predictions" },
+  { id: "chat",      icon: "chat",  label: "Chat" },
+  { id: "report",    icon: "report",  label: "Reports" },
+  { id: "history",   icon: "history",  label: "History" },
 ];
 
 function Sidebar({ page, setPage, user, onLogout }) {
@@ -499,7 +533,7 @@ function Sidebar({ page, setPage, user, onLogout }) {
           <div key={n.id} className={`nav-item${page === n.id ? " active" : ""}`}
             onClick={() => setPage(n.id)}
             style={{ display: "flex", alignItems: "center", gap: 9, padding: "7.5px 9px", borderRadius: 9, fontSize: 12.5, color: "var(--text2)", marginBottom: 2 }}>
-            <span style={{ fontSize: 14, width: 16 }}>{n.icon}</span>
+            <Icon name={n.icon} size={17} />
             {n.label}
           </div>
         ))}
@@ -535,7 +569,7 @@ function Topbar({ page, theme, setTheme, jobResult }) {
       <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 3, background: "var(--bg3)", border: "1px solid var(--border)", borderRadius: 20, padding: 3 }}>
         {["light", "dark"].map(t => (
           <button key={t} onClick={() => setTheme(t)} className={`theme-btn${theme === t ? " active" : ""}`}>
-            {t === "light" ? "☀ light" : "🌙 dark"}
+            <><Icon name={t === "light" ? "sun" : "moon"} size={13} /> {t}</>
           </button>
         ))}
       </div>
@@ -662,7 +696,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
           onDrop={drop}
           onClick={() => fileRef.current.click()}>
           <input ref={fileRef} type="file" accept=".csv,.tsv,.txt,.xlsx,.xls" hidden onChange={e => e.target.files[0] && setFile(e.target.files[0])} />
-          <div style={{ width: 42, height: 42, borderRadius: 10, background: "var(--bg3)", border: ".5px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 10px", fontSize: 22 }}>📁</div>
+          <div style={{ width: 42, height: 42, borderRadius: 10, background: "var(--bg3)", border: ".5px solid var(--border)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 10px", fontSize: 22 }}><Icon name="folder" size={22}/></div>
           {file ? (
             <>
               <div style={{ fontSize: 13, fontWeight: 500, color: "var(--accent)" }}>{file.name}</div>
@@ -712,7 +746,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
           </div>
           {held && (
             <div data-testid="review-panel" style={{ fontSize: 12.5, background: "rgba(245,158,11,.12)", border: "1px solid #f59e0b", padding: "12px 14px", borderRadius: 8, display: "flex", flexDirection: "column", gap: 8 }}>
-              <div style={{ fontWeight: 600 }}>⚠ Held for review</div>
+              <div style={{ fontWeight: 600 }}>Review required</div>
               <div>The Guardrails agent flagged this analysis. Please read the points below before relying on the results.</div>
               <ul style={{ margin: 0, paddingLeft: 18 }}>
                 {held.flags.map((f, i) => <li key={i}><b>{f.check}</b>: {f.message}</li>)}
@@ -725,7 +759,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
           )}
           {err && <div style={{ fontSize: 12, color: "var(--danger)", background: "var(--danger-bg)", padding: "8px 12px", borderRadius: 6 }}>{err}</div>}
           <button className="btn-primary" onClick={() => analyse()} disabled={loading} style={{ alignSelf: "flex-start" }}>
-            {loading ? <Spinner size={13} /> : "🚀"} {loading ? "Analysing..." : "Run Analysis"}
+            {loading ? <Spinner size={13} /> : <Icon name="analyst" size={14} />} {loading ? "Analysing..." : "Run Analysis"}
           </button>
         </div>
       </div>
@@ -758,7 +792,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
 
 // ─── INSIGHTS PAGE ────────────────────────────────────────────────
 function InsightsPage({ jobResult, setPage }) {
-  if (!jobResult) return <Empty icon="💡" title="No analysis yet" sub="Upload a CSV to generate AI insights" action="⬆ Upload Dataset" onAction={() => setPage("upload")} />;
+  if (!jobResult) return <Empty icon="folder" title="No analysis yet" sub="Upload a CSV to generate AI insights" action="Upload Dataset" onAction={() => setPage("upload")} />;
 
   const insights  = jobResult.key_insights   || [];
   const actions   = jobResult.actions        || [];
@@ -778,7 +812,7 @@ function InsightsPage({ jobResult, setPage }) {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
         <KpiCard label="Total Rows"     value={(stats.total_rows || 0).toLocaleString()} />
         <KpiCard label="Columns"        value={stats.total_cols || 0} />
-        <KpiCard label="Data Quality"   value={`${stats.quality_score || 0}%`} sub={stats.quality_score > 80 ? "Good ↑" : "Needs improvement ↓"} />
+        <KpiCard label="Data Quality"   value={`${stats.composite_quality_score ?? stats.quality_score ?? 0}%`} sub="Composite quality score" />
         <KpiCard label="Insights Found" value={stats.insights_count || insights.length} />
       </div>
 
@@ -869,7 +903,7 @@ function InsightsPage({ jobResult, setPage }) {
       {/* Warnings */}
       {warnings.length > 0 && (
         <div className="card" style={{ padding: 16 }}>
-          <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 10 }}>⚠️ Warning Flags</div>
+          <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 10 }}><Icon name="warning" size={14}/>️ Warning Flags</div>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
             {warnings.map((w, i) => (
               <div key={i} style={{
@@ -891,7 +925,7 @@ function InsightsPage({ jobResult, setPage }) {
 // ─── CHARTS PAGE ─────────────────────────────────────────────────
 function ChartsPage({ jobResult, setPage }) {
   const [tab, setTab] = useState("dist");
-  if (!jobResult) return <Empty icon="📊" title="No charts yet" sub="Run an analysis first" action="⬆ Upload" onAction={() => setPage("upload")} />;
+  if (!jobResult) return <Empty icon="folder" title="No charts yet" sub="Run an analysis first" action="Upload" onAction={() => setPage("upload")} />;
 
   const ml   = jobResult.ml_recommendation || {};
   const dist = jobResult.distribution_data || [];
@@ -920,7 +954,7 @@ function ChartsPage({ jobResult, setPage }) {
       {/* Distributions */}
       {tab === "dist" && (
         dist.length === 0
-          ? <Empty icon="📈" title="No distribution data" sub="Distribution data was not captured during analysis" />
+          ? <Empty icon="folder" title="No distribution data" sub="Distribution data was not captured during analysis" />
           : <div style={{ display: "grid", gridTemplateColumns: "repeat(2,1fr)", gap: 12 }}>
               {dist.slice(0, 6).map((d, i) => {
                 const data = d.histogram
@@ -950,7 +984,7 @@ function ChartsPage({ jobResult, setPage }) {
       {/* Model comparison */}
       {tab === "models" && (
         mods.length === 0
-          ? <Empty icon="🤖" title="No model data" sub="ML models were not trained" />
+          ? <Empty icon="folder" title="No model data" sub="ML models were not trained" />
           : <div className="card" style={{ padding: 16 }}>
               <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 6 }}>Model Score Comparison</div>
               <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 16 }}>Task: {ml.task_type} · Target: {ml.target_column}</div>
@@ -972,7 +1006,7 @@ function ChartsPage({ jobResult, setPage }) {
       {/* Feature importance */}
       {tab === "feat" && (
         fi.length === 0
-          ? <Empty icon="⭐" title="No feature data" sub="Feature importances not available" />
+          ? <Empty icon="folder" title="No feature data" sub="Feature importances not available" />
           : <div className="card" style={{ padding: 16 }}>
               <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 16 }}>Top Feature Importances</div>
               <ResponsiveContainer width="100%" height={Math.max(200, Math.min(fi.length, 12) * 32)}>
@@ -991,7 +1025,7 @@ function ChartsPage({ jobResult, setPage }) {
       {/* Future trend */}
       {tab === "trend" && (
         !fp?.future_y?.length
-          ? <Empty icon="🔮" title="No forecast data" sub="Future prediction requires time-series data" />
+          ? <Empty icon="folder" title="No forecast data" sub="Future prediction requires time-series data" />
           : <div className="card" style={{ padding: 16 }}>
               <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 4 }}>Future Trend — {fp.target}</div>
               <div style={{ fontSize: 11, color: "var(--text3)", marginBottom: 16 }}>Trend R²: {fp.trend_r2} · Std Error: ±{fp.std_error} · {fp.future_steps} steps ahead</div>
@@ -1020,7 +1054,7 @@ function ChartsPage({ jobResult, setPage }) {
 
 // ─── ML RESULTS PAGE ─────────────────────────────────────────────
 function MLResultsPage({ jobResult, setPage }) {
-  if (!jobResult) return <Empty icon="🤖" title="No ML results" sub="Run an analysis to train models" action="⬆ Upload" onAction={() => setPage("upload")} />;
+  if (!jobResult) return <Empty icon="folder" title="No ML results" sub="Run an analysis to train models" action="Upload" onAction={() => setPage("upload")} />;
 
   const ml   = jobResult.ml_recommendation || {};
   const mods = ml.models          || [];
@@ -1039,7 +1073,7 @@ function MLResultsPage({ jobResult, setPage }) {
       {ml.task_type === "regression" && Number.isFinite(Number(ml.best_score)) && Number(ml.best_score) < 0.5 && <div className="card" role="status" style={{padding:15,borderLeft:"3px solid var(--warning)",background:"var(--warning-bg)",fontSize:12,lineHeight:1.6}}>
         <b>Limited predictive performance.</b> Hold-out R² = {Number(ml.best_score).toFixed(3)}. Predictions are exploratory estimates, not reliable forecasts. {Number(jobResult?.stats?.total_rows || 0) < 100 ? "The dataset is small; evaluation scores may vary substantially." : "Validate on independent data before decisions."}
       </div>}
-      {ml.class_imbalance?.imbalanced && <div className="card" style={{padding:14,fontSize:12,color:"var(--text2)"}}>⚠ Class imbalance detected. Review per-class recall and macro F1; accuracy alone can be misleading.</div>}
+      {ml.class_imbalance?.imbalanced && <div className="card" style={{padding:14,fontSize:12,color:"var(--text2)"}}><Icon name="warning" size={14}/> Class imbalance detected. Review per-class recall and macro F1; accuracy alone can be misleading.</div>}
       {/* Best model banner */}
       {ml.best_model && (
         <div className="card" style={{ padding: 16, borderLeft: "3px solid var(--accent)" }}>
@@ -1162,6 +1196,8 @@ function PredictPage({ token, jobId, setPage }) {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [ready, setReady] = useState(false);
+  const [modelStatus, setModelStatus] = useState("idle");
+  const [retryCount, setRetryCount] = useState(0);
   const [showAll, setShowAll] = useState(false);
   const [history, setHistory] = useState([]);
   const [scenario, setScenario] = useState(null);
@@ -1169,7 +1205,7 @@ function PredictPage({ token, jobId, setPage }) {
   const [whatIfBusy, setWhatIfBusy] = useState(false);
 
   useEffect(() => {
-    setReady(false); setFeats([]); setInputs({}); setResult(null); setHistory([]); setScenario(null); setWhatIfResult(null); setErr("");
+    setModelStatus("loading"); setReady(false); setFeats([]); setInputs({}); setResult(null); setHistory([]); setScenario(null); setWhatIfResult(null); setErr("");
     if (!jobId) return;
     let cancelled = false;
     apiFetch(`/api/predict_info/${jobId}`, {}, token)
@@ -1180,11 +1216,11 @@ function PredictPage({ token, jobId, setPage }) {
         setFeats(d.features); setTask(d.task_type || ""); setTarget(d.target || "");
         const defaults = {};
         d.features.forEach(f => { defaults[f.name] = f.input_type === "categorical" ? (f.default ?? f.options?.[0] ?? "") : Number.isFinite(Number(f.default ?? f.mean)) && (f.default ?? f.mean) != null ? String(Number(Number(f.default ?? f.mean).toFixed(3))) : ""; });
-        setInputs(defaults); setReady(true);
+        setInputs(defaults); setReady(true); setModelStatus("ready");
       })
-      .catch(e => { if (!cancelled) setErr(e.message || "Could not load prediction inputs"); });
+      .catch(e => { if (!cancelled) { setModelStatus("error"); setErr(e.message || "Could not load prediction inputs"); } });
     return () => { cancelled = true; };
-  }, [jobId, token]);
+  }, [jobId, token, retryCount]);
 
   const invalid = feats.filter(f => {
     const raw = String(inputs[f.name] ?? "").trim();
@@ -1229,7 +1265,7 @@ function PredictPage({ token, jobId, setPage }) {
   const displayed = showAll ? feats : feats.slice(0, 8);
   const pretty = name => String(name).replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
 
-  if (!jobId) return <Empty icon="🎯" title="No model trained" sub="Upload and analyse a dataset first" action="⬆ Upload" onAction={() => setPage("upload")} />;
+  if (!jobId) return <Empty icon="predict" title="No model trained" sub="Upload and analyse a dataset first" action="Upload" onAction={() => setPage("upload")} />;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, animation: "fadeIn .25s ease", maxWidth: 1440, margin: "0 auto", width: "100%" }}>
@@ -1240,7 +1276,7 @@ function PredictPage({ token, jobId, setPage }) {
             <h2 style={{ fontSize: 25, marginBottom: 5 }}>Make data-driven predictions</h2>
             <p style={{ color: "var(--text2)", fontSize: 12 }}>Use the trained model to explore outcomes for new observations.</p>
           </div>
-          <Badge type={ready ? "green" : "yellow"}>{ready ? "● Model ready" : "Model loading"}</Badge>
+          <Badge type={ready ? "green" : "yellow"}>{ready ? "Model ready" : (modelStatus === "error" ? "Model unavailable" : "Loading model")}</Badge>
         </div>
         {ready && <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 17 }}>
           <Badge>{taskType || "Prediction"}</Badge><Badge type="gray">Target: {target || "Unknown"}</Badge><Badge type="gray">{feats.length} features</Badge>
@@ -1253,6 +1289,7 @@ function PredictPage({ token, jobId, setPage }) {
           {ready && <button className="btn-ghost" onClick={() => { const defaults = {}; feats.forEach(f => { defaults[f.name] = f.default != null ? String(f.default) : (f.input_type === "categorical" ? (f.options?.[0] ?? "") : ""); }); setInputs(defaults); setResult(null); setErr(""); }}>↺ Reset values</button>}
         </div>
         {!ready && !err && <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "18px 0", color: "var(--text2)" }}><Spinner /> Loading model metadata…</div>}
+        {!ready && err && <div role="alert" style={{padding:16,background:"var(--danger-bg)",borderRadius:10,color:"var(--danger)",display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><span>{err}. If the analysis is held for review, approve it in Upload first.</span><button className="btn-ghost" onClick={() => setRetryCount(v => v + 1)}>Retry model loading</button></div>}
         {ready && <>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(min(100%,280px),1fr))", gap: 16 }}>
             {displayed.map(f => {
@@ -1266,7 +1303,7 @@ function PredictPage({ token, jobId, setPage }) {
           </div>
           {feats.length > 8 && <button className="btn-ghost" style={{ marginTop: 16 }} onClick={() => setShowAll(v => !v)}>{showAll ? "Show fewer features" : `Show all ${feats.length} features`}</button>}
           <div style={{ display: "flex", alignItems: "center", gap: 14, marginTop: 22, flexWrap: "wrap" }}>
-            <button className="btn-primary" onClick={predict} disabled={loading || invalid.length > 0} style={{ padding: "12px 20px" }}>{loading ? <Spinner size={13} /> : "✦"} {loading ? "Running prediction…" : "Run prediction"}</button>
+            <button className="btn-primary" onClick={predict} disabled={loading || invalid.length > 0} style={{ padding: "12px 20px" }}>{loading ? <Spinner size={13} /> : <Icon name="predict" size={14} />} {loading ? "Running prediction…" : "Run prediction"}</button>
             <span style={{ color: invalid.length ? "var(--danger)" : "var(--text3)", fontSize: 11 }}>{invalid.length ? `${invalid.length} field(s) need valid values` : "All feature values valid"}</span>
           </div>
         </>}
@@ -1360,7 +1397,7 @@ function ChatPage({ token, jobId }) {
         background: m.role === "user" ? "linear-gradient(135deg,var(--accent),var(--purple))" : "var(--bg3)",
         color: m.role === "user" ? "var(--accent-text)" : "var(--text2)",
       }}>
-        {m.role === "user" ? (token ? "U" : "G") : "🤖"}
+        {m.role === "user" ? (token ? "U" : "G") : <Icon name="analyst" size={17} />}
       </div>
       <div style={{
         maxWidth: "72%", padding: "9px 13px", borderRadius: 10, fontSize: 13, lineHeight: 1.55,
@@ -1380,7 +1417,7 @@ function ChatPage({ token, jobId }) {
         {msgs.map((m, i) => <Bubble key={i} m={m} />)}
         {loading && (
           <div style={{ display: "flex", gap: 10 }}>
-            <div style={{ width: 30, height: 30, borderRadius: "50%", background: "var(--bg3)", display: "flex", alignItems: "center", justifyContent: "center" }}>🤖</div>
+            <div style={{ width: 30, height: 30, borderRadius: "50%", background: "var(--bg3)", display: "flex", alignItems: "center", justifyContent: "center" }}><Icon name="analyst" size={17}/></div>
             <div style={{ padding: "10px 14px", background: "var(--bg3)", borderRadius: 10, display: "flex", gap: 4, alignItems: "center" }}>
               {[0,1,2].map(i => <div key={i} style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--text3)", animation: `typing 1s ease ${i*0.2}s infinite` }} />)}
             </div>
@@ -1421,7 +1458,7 @@ function ReportPage({ token, jobId, jobResult, setPage }) {
     finally { if (type === "pdf") setDlPDF(false); else setDlCSV(false); }
   }
 
-  if (!jobResult) return <Empty icon="📄" title="No report yet" sub="Run an analysis to generate a report" action="⬆ Upload" onAction={() => setPage("upload")} />;
+  if (!jobResult) return <Empty icon="folder" title="No report yet" sub="Run an analysis to generate a report" action="Upload" onAction={() => setPage("upload")} />;
 
   const ml    = jobResult.ml_recommendation || {};
   const stats = jobResult.stats || {};
@@ -1455,10 +1492,10 @@ function ReportPage({ token, jobId, jobResult, setPage }) {
         )}
         <div style={{ display: "flex", gap: 10 }}>
           <button className="btn-primary" onClick={() => download("pdf")} disabled={dlPDF || !jobId}>
-            {dlPDF ? <Spinner size={13} /> : "📥"} {dlPDF ? "Generating..." : "Download PDF Report"}
+            {dlPDF ? <Spinner size={13} /> : <Icon name="download" size={14} />} {dlPDF ? "Generating..." : "Download PDF Report"}
           </button>
           <button className="btn-ghost" onClick={() => download("csv")} disabled={dlCSV || !jobId}>
-            {dlCSV ? <Spinner size={13} /> : "📊"} Cleaned CSV
+            {dlCSV ? <Spinner size={13} /> : <Icon name="charts" size={14} />} Cleaned CSV
           </button>
         </div>
       </div>
@@ -1507,7 +1544,7 @@ function HistoryPage({ token, setPage }) {
 
   if (runs === null) return <div style={{ padding: 40, textAlign: "center" }}><Spinner size={20} /></div>;
   if (runs.length === 0) {
-    return <Empty icon="📈" title="No analysis history yet" sub="Run an analysis to begin. History availability depends on server storage and deployment configuration." action="⬆ Upload Dataset" onAction={() => setPage("upload")} />;
+    return <Empty icon="folder" title="No analysis history yet" sub="Run an analysis to begin. History availability depends on server storage and deployment configuration." action="Upload Dataset" onAction={() => setPage("upload")} />;
   }
 
   const chartData = [...runs].reverse().map((r, i) => ({
@@ -1583,18 +1620,18 @@ function DashboardPage({ jobResult, jobStep, jobStatus, jobStepHistory, setPage 
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: 16, animation: "fadeIn .2s ease" }}>
         <div className="card" style={{ padding: 36, textAlign: "center" }}>
-          <div style={{ fontSize: 42, marginBottom: 14 }}>🧠</div>
+          <div style={{ fontSize: 42, marginBottom: 14 }}><Icon name="analyst" size={40} /></div>
           <div style={{ fontSize: 18, fontWeight: 600, letterSpacing: "-0.3px", marginBottom: 8 }}>Welcome to DataMind AI</div>
           <div style={{ fontSize: 13, color: "var(--text3)", marginBottom: 24, lineHeight: 1.6 }}>
             Upload CSV, TSV or Excel data to start your AI-powered analysis.<br/>
             Four intelligent agents will clean, analyse, model, and summarise your data.
           </div>
-          <button className="btn-primary" onClick={() => setPage("upload")}>⬆ Upload Dataset</button>
+          <button className="btn-primary" onClick={() => setPage("upload")}><Icon name="upload" size={15} /> Upload Dataset</button>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
-          {[["🔍","Data Detective","Cleans & profiles your CSV automatically"],["🧠","AI Analyst","Produces dataset-grounded insights when AI services are available"],["⚙️","ML Engineer","Trains & compares 5+ ML models with SHAP"],["📝","Reporter","Writes plain-English executive summaries"]].map(([i,t,d]) => (
+          {[["search","Data Detective","Cleans & profiles your CSV automatically"],["analyst","AI Analyst","Produces dataset-grounded insights when AI services are available"],["settings","ML Engineer","Trains & compares 5+ ML models with SHAP"],["report","Reporter","Writes plain-English executive summaries"]].map(([i,t,d]) => (
             <div key={t} className="card" style={{ padding: "14px 16px" }}>
-              <div style={{ fontSize: 24, marginBottom: 8 }}>{i}</div>
+              <div style={{ fontSize: 24, marginBottom: 8 }}><Icon name={i} size={25} /></div>
               <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 4 }}>{t}</div>
               <div style={{ fontSize: 11, color: "var(--text3)", lineHeight: 1.4 }}>{d}</div>
             </div>
@@ -1609,7 +1646,7 @@ function DashboardPage({ jobResult, jobStep, jobStatus, jobStepHistory, setPage 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
         <KpiCard label="Rows Analysed" value={(stats.total_rows || 0).toLocaleString()} />
         <KpiCard label="Columns"       value={stats.total_cols || 0} />
-        <KpiCard label="Data Quality"  value={`${stats.quality_score || 0}%`} />
+        <KpiCard label="Data Quality"  value={`${stats.composite_quality_score ?? stats.quality_score ?? 0}%`} sub="Composite quality score" />
         <KpiCard label="Best Model"    value={ml.best_model || "—"} sub={formatScore(ml.best_score, ml.task_type)} highlight />
       </div>
 
@@ -1621,11 +1658,20 @@ function DashboardPage({ jobResult, jobStep, jobStatus, jobStepHistory, setPage 
         <div className="card" style={{ padding: 16 }}>
           <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 12 }}>Quick Navigation</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
-            {[["💡","Insights","insights"],["📊","Charts","charts"],["🤖","ML Results","ml"],["🎯","Predict","predict"],["💬","Chat AI","chat"],["📄","Reports","report"]].map(([ico,lab,pg]) => (
+            {[["insights","Insights","insights"],["charts","Charts","charts"],["ml","ML Results","ml"],["predict","Predict","predict"],["chat","Chat AI","chat"],["report","Reports","report"]].map(([ico,lab,pg]) => (
               <button key={pg} className="btn-ghost" onClick={() => setPage(pg)} style={{ justifyContent: "center", padding: 10 }}>
-                {ico} {lab}
+                <Icon name={ico} size={16} /> {lab}
               </button>
             ))}
+          </div>
+          <div style={{marginTop:20,padding:17,border:"1px solid var(--border)",borderRadius:12,background:"var(--bg2)"}}>
+            <div style={{display:"flex",alignItems:"center",gap:9,fontWeight:600,fontSize:13,marginBottom:10}}><Icon name="ml" size={16}/> Model overview</div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(130px,1fr))",gap:12}}>
+              <div><div style={{fontSize:10,color:"var(--text3)",marginBottom:5}}>Selected model</div><strong style={{fontSize:13}}>{ml.best_model || "Not available"}</strong></div>
+              <div><div style={{fontSize:10,color:"var(--text3)",marginBottom:5}}>Hold-out performance</div><strong style={{fontSize:13}}>{formatScore(ml.best_score, ml.task_type)}</strong></div>
+              <div><div style={{fontSize:10,color:"var(--text3)",marginBottom:5}}>Task</div><strong style={{fontSize:13,textTransform:"capitalize"}}>{ml.task_type || "Not available"}</strong></div>
+            </div>
+            <p style={{fontSize:11,color:"var(--text3)",marginTop:12,lineHeight:1.6}}>Evaluation metrics describe observed performance on test data, not confidence in every future prediction. Review class-specific performance and validation before deployment.</p>
           </div>
         </div>
       </div>
@@ -1661,7 +1707,7 @@ function AppShell({ user, token, onLogout }) {
   // NOTE: no longer accepts/stores an apiKey — the chat API key box was
   // removed from ChatPage, and /api/analyze never needed one to begin with.
   function setJobMeta({ jobId }) {
-    setJobId(jobId); setStep(1); setStatus("running");
+    setJobId(jobId); setResult(null); setJobStepHistory([]); setStep(1); setStatus("running");
   }
 
   return (
@@ -1671,7 +1717,7 @@ function AppShell({ user, token, onLogout }) {
         <Topbar page={page} theme={theme} setTheme={setTheme} jobResult={jobResult} />
         <div className="scrollbar" style={{ flex: 1, overflowY: "auto", padding: "2px 4px 4px" }}>
           {page === "dashboard" && <DashboardPage jobResult={jobResult} jobStep={jobStep} jobStatus={jobStatus} jobStepHistory={jobStepHistory} setPage={setPage} />}
-          {page === "upload"    && <UploadPage token={token} onJobDone={handleJobDone} setJobMeta={setJobMeta} />}
+          <div style={{display:page === "upload" ? "block" : "none"}}><UploadPage token={token} onJobDone={handleJobDone} setJobMeta={setJobMeta} /></div>
           {page === "insights"  && <InsightsPage  jobResult={jobResult} setPage={setPage} />}
           {page === "charts"    && <ChartsPage    jobResult={jobResult} setPage={setPage} />}
           {page === "ml"        && <MLResultsPage jobResult={jobResult} setPage={setPage} />}
