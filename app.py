@@ -825,15 +825,22 @@ def _prediction_rows(payloads, feature_cols, artifacts=None):
     """Validate exact model input order; never silently substitute zero."""
     rows = []
     mappings = (artifacts or {}).get("categorical_mappings", {})
+    defaults = (artifacts or {}).get("feature_defaults", {})
     for idx, values in enumerate(payloads):
         if not isinstance(values, dict):
             raise ValueError(f"Scenario {idx + 1}: inputs must be an object")
-        missing = [col for col in feature_cols if col not in values or values[col] is None or str(values[col]).strip() == ""]
+        # Missing inputs use train-derived defaults where available. Never use
+        # silent zero substitution for a field with no known default.
+        missing = [col for col in feature_cols if
+                   (col not in values or values[col] is None or str(values[col]).strip() == "")
+                   and col not in defaults]
         if missing:
             raise ValueError(f"Scenario {idx + 1}: missing features: {', '.join(missing[:12])}")
         row = []
         for col in feature_cols:
-            raw = values[col]
+            raw = values.get(col)
+            if raw is None or str(raw).strip() == "":
+                raw = defaults[col]
             if col in mappings:
                 options = mappings[col]
                 if str(raw) not in options:
@@ -880,6 +887,9 @@ def _prediction_probabilities(model, X_scaled, artifacts):
     return [{label: round(float(prob) * 100, 2) for label, prob in zip(labels, row)} for row in probs], [round(float(max(row)) * 100, 1) for row in probs]
 
 
+from agents.prediction_advisor import build_prediction_advice
+
+
 @app.route("/api/predict/<job_id>", methods=["POST"])
 def predict(job_id):
     job, err = _get_owned_job(job_id, require_done=True)
@@ -895,11 +905,23 @@ def predict(job_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     try:
+        imputer = artifacts.get("imputer")
+        X = imputer.transform(X) if imputer is not None else X
         X_scaled = scaler.transform(X) if scaler is not None else X
         pred_raw = model.predict(X_scaled)[0]
         prediction = _prediction_output(pred_raw, artifacts)
         probs, confidence = _prediction_probabilities(model, X_scaled, artifacts)
+        ml_info = job["result"].get("ml_safe", {})
+        advice = build_prediction_advice(
+            prediction=prediction, task_type=artifacts.get("task_type", "regression"),
+            target=artifacts.get("target_column"), inputs=payload.get("inputs") or {},
+            class_probabilities=probs[0] if probs else None,
+            feature_importances=ml_info.get("feature_importances", []),
+            evaluation_warnings=ml_info.get("evaluation_warnings", []),
+            best_score=artifacts.get("best_score"),
+            score_metric=ml_info.get("score_metric"))
         return jsonify({"prediction": prediction, "prediction_label": str(prediction),
+                        "advisor": advice,
                         "confidence": confidence[0] if confidence else None,
                         "class_probabilities": probs[0] if probs else None,
                         "task_type": artifacts.get("task_type", "regression"),
@@ -919,16 +941,17 @@ def predict_info(job_id):
     col_stats = ctx.get("column_stats", {})
     features = []
     mappings = artifacts.get("categorical_mappings", {})
+    defaults = artifacts.get("feature_defaults", {})
     for col in feat_cols:
         st = col_stats.get(col, {})
         if col in mappings:
-            features.append({"name": col, "input_type": "categorical", "options": mappings[col]})
+            features.append({"name": col, "input_type": "categorical", "options": mappings[col], "default": defaults.get(col, mappings[col][0] if mappings[col] else "")})
         else:
             features.append({"name": col, "min": _safe_val(st.get("min")),
                              "max": _safe_val(st.get("max")),
                              "mean": _safe_val(st.get("mean")),
                              "median": _safe_val(st.get("median")),
-                             "input_type": "numeric"})
+                             "input_type": "numeric", "default": defaults.get(col)})
     le_target = artifacts.get("le_target")
     classes = [str(_safe_val(v)) for v in le_target.classes_] if le_target is not None else None
     return jsonify({"features": features, "task_type": artifacts.get("task_type", "regression"),
@@ -959,6 +982,8 @@ def whatif(job_id):
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     try:
+        imputer = artifacts.get("imputer")
+        X = imputer.transform(X) if imputer is not None else X
         X_scaled = scaler.transform(X) if scaler is not None else X
         predictions = model.predict(X_scaled)
         probs, confidences = _prediction_probabilities(model, X_scaled, artifacts)
@@ -1449,6 +1474,7 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
         ml_artifacts = {
             "model":         ml.get("_model_obj"),
             "scaler":        ml.get("_scaler_obj"),
+            "imputer":       ml.get("_imputer_obj"),
             "feature_cols":  ml.get("_feature_cols", []),
             "task_type":     ml.get("task_type"),
             "target_column": ml.get("target_column"),
@@ -1457,6 +1483,16 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
             "le_target":     ml.get("_le_target"),
             "numeric_cols":  ml.get("_numeric_cols", []),
             "categorical_mappings": ml.get("_categorical_mappings", {}),
+            "feature_defaults": {
+                col: (ml.get("_categorical_mappings", {}).get(col, [""])[0]
+                      if col in ml.get("_categorical_mappings", {}) else
+                      _safe_val(ml["_imputer_obj"].statistics_[idx]))
+                for idx, col in enumerate(ml.get("_feature_cols", []))
+                if (col in ml.get("_categorical_mappings", {}) and ml.get("_categorical_mappings", {}).get(col))
+                or (ml.get("_imputer_obj") is not None and
+                    idx < len(ml["_imputer_obj"].statistics_) and
+                    np.isfinite(ml["_imputer_obj"].statistics_[idx]))
+            },
         }
 
         ml_rec = ana.get("ml_recommendation", {})
