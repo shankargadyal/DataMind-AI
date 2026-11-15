@@ -182,6 +182,10 @@ const CSS = `
   @media(max-width:1150px){.dm-login-inner{grid-template-columns:minmax(0,1fr) minmax(330px,.85fr);gap:24px}.dm-story{min-height:610px}.dm-laptop{width:320px;right:-3%;bottom:2%;opacity:.9}.dm-story-content{max-width:470px}.dm-story h1{font-size:44px}.dm-features{max-width:320px}}
   @media(max-width:850px){.dm-login-inner{grid-template-columns:1fr;max-width:650px;padding:35px 22px 60px;gap:30px}.dm-story{min-height:auto}.dm-story-content{margin:38px 0 10px}.dm-story h1{font-size:clamp(35px,7vw,49px)}.dm-laptop{position:relative;right:auto;bottom:auto;transform:none;width:min(100%,430px);margin:22px auto 0}.dm-auth-card{max-width:100%}}
   @media(max-width:480px){.dm-login-inner{padding:24px 16px 40px}.dm-brand-name{font-size:27px}.dm-brand-tag{font-size:10px}.dm-mark{width:45px;transform:scale(.8);transform-origin:left}.dm-story h1{font-size:37px}.dm-feature-icon{width:43px;height:43px}.dm-laptop{width:95%}.dm-laptop-screen{height:195px}.dm-auth-card{padding:24px 20px;border-radius:23px}.dm-auth-tabs{margin-bottom:28px}.dm-auth-tabs button{font-size:13px}}
+  /* Cinematic depth without a WebGL dependency or login performance penalty. */
+  @keyframes dmFloat3D{0%,100%{transform:perspective(1100px) rotateY(-13deg) rotateX(4deg) translateY(0)}50%{transform:perspective(1100px) rotateY(-8deg) rotateX(1deg) translateY(-13px)}}
+  @keyframes dmReveal{from{opacity:0;transform:translateY(22px)}to{opacity:1;transform:translateY(0)}}
+  @media(min-width:851px){.dm-laptop{animation:dmFloat3D 9s ease-in-out infinite;transform-style:preserve-3d}.dm-auth-card{animation:dmReveal .9s ease-out both;box-shadow:0 30px 85px rgba(92,47,11,.14),inset 0 1px 0 rgba(255,255,255,.85)}.dm-story-content{animation:dmReveal .8s ease-out both}}
   @media(prefers-reduced-motion:reduce){.dm-login *{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
 
 `;
@@ -564,7 +568,9 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
   async function analyse(overrideFile, overrideOpts) {
     const f = overrideFile || file;
     setHeld(null);
-    if (!f) { setErr("Please select a CSV file"); return; }
+    if (!f) { setErr("Please select a dataset file"); return; }
+    if (!/\.(csv|tsv|txt|xlsx|xls)$/i.test(f.name)) { setErr("Supported formats: CSV, TSV, TXT, XLSX and XLS"); return; }
+    if (f.size > 100 * 1024 * 1024) { setErr("The maximum file size is 100 MB"); return; }
     setErr(""); setLoading(true); setJobSt("running"); setLogs([]); setStep(1);
     const fd = new FormData();
     fd.append("file", f); fd.append("query", (overrideOpts && overrideOpts.query) || query);
@@ -610,8 +616,8 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
   const drop = (e) => {
     e.preventDefault(); setDragging(false);
     const f = e.dataTransfer.files[0];
-    if (f && (f.name.endsWith(".csv") || f.name.endsWith(".xlsx"))) setFile(f);
-    else setErr("Only CSV / Excel files supported");
+    if (f && /\.(csv|tsv|txt|xlsx|xls)$/i.test(f.name) && f.size <= 100 * 1024 * 1024) { setFile(f); setErr(""); }
+    else setErr("Upload CSV, TSV, TXT or Excel files up to 100 MB");
   };
 
   return (
@@ -870,6 +876,7 @@ function ChartsPage({ jobResult, setPage }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, animation: "fadeIn .2s ease" }}>
+      <p style={{fontSize:11,color:"var(--text3)"}}>Charts describe uploaded data and model outputs; relationships do not by themselves establish causation.</p>
       <div style={{ display: "flex", gap: 3, background: "var(--bg3)", borderRadius: 8, padding: 3, alignSelf: "flex-start" }}>
         {TABS.map(t => (
           <button key={t.id} onClick={() => setTab(t.id)} className={`tab-btn${tab === t.id ? " active" : ""}`}>{t.label}</button>
@@ -991,6 +998,11 @@ function MLResultsPage({ jobResult, setPage }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, animation: "fadeIn .2s ease" }}>
+      {ml.evaluation_warnings?.length > 0 && <div className="card" style={{padding:16,borderLeft:"3px solid var(--warning)",background:"var(--warning-bg)"}} role="status">
+        <b style={{fontSize:13}}>Model evaluation notes</b>
+        {ml.evaluation_warnings.slice(0,5).map((w,i)=><p key={i} style={{fontSize:12,marginTop:7,lineHeight:1.5}}>{w}</p>)}
+      </div>}
+      {ml.class_imbalance?.imbalanced && <div className="card" style={{padding:14,fontSize:12,color:"var(--text2)"}}>⚠ Class imbalance detected. Review per-class recall and macro F1; accuracy alone can be misleading.</div>}
       {/* Best model banner */}
       {ml.best_model && (
         <div className="card" style={{ padding: 16, borderLeft: "3px solid var(--accent)" }}>
@@ -1115,9 +1127,12 @@ function PredictPage({ token, jobId, setPage }) {
   const [ready, setReady] = useState(false);
   const [showAll, setShowAll] = useState(false);
   const [history, setHistory] = useState([]);
+  const [scenario, setScenario] = useState(null);
+  const [whatIfResult, setWhatIfResult] = useState(null);
+  const [whatIfBusy, setWhatIfBusy] = useState(false);
 
   useEffect(() => {
-    setReady(false); setFeats([]); setInputs({}); setResult(null); setHistory([]); setErr("");
+    setReady(false); setFeats([]); setInputs({}); setResult(null); setHistory([]); setScenario(null); setWhatIfResult(null); setErr("");
     if (!jobId) return;
     let cancelled = false;
     apiFetch(`/api/predict_info/${jobId}`, {}, token)
@@ -1127,7 +1142,7 @@ function PredictPage({ token, jobId, setPage }) {
         if (!Array.isArray(d.features) || !d.features.length) throw new Error("No prediction features available");
         setFeats(d.features); setTask(d.task_type || ""); setTarget(d.target || "");
         const defaults = {};
-        d.features.forEach(f => { defaults[f.name] = f.input_type === "categorical" ? (f.options?.[0] ?? "") : Number.isFinite(Number(f.mean)) && f.mean != null ? String(Number(Number(f.mean).toFixed(3))) : ""; });
+        d.features.forEach(f => { defaults[f.name] = f.input_type === "categorical" ? (f.default ?? f.options?.[0] ?? "") : Number.isFinite(Number(f.default ?? f.mean)) && (f.default ?? f.mean) != null ? String(Number(Number(f.default ?? f.mean).toFixed(3))) : ""; });
         setInputs(defaults); setReady(true);
       })
       .catch(e => { if (!cancelled) setErr(e.message || "Could not load prediction inputs"); });
@@ -1138,7 +1153,7 @@ function PredictPage({ token, jobId, setPage }) {
     const raw = String(inputs[f.name] ?? "").trim();
     if (f.input_type === "categorical") return !f.options?.includes(raw);
     const n = Number(raw);
-    return !raw || !Number.isFinite(n) || (Number.isFinite(f.min) && n < f.min) || (Number.isFinite(f.max) && n > f.max);
+    return !raw || !Number.isFinite(n);
   });
 
   async function predict() {
@@ -1151,10 +1166,24 @@ function PredictPage({ token, jobId, setPage }) {
       const r = await apiFetch(`/api/predict/${jobId}`, { method: "POST", body: JSON.stringify({ inputs: nums }) }, token);
       const d = await r.json();
       if (!r.ok) throw new Error(d.error || "Prediction failed");
-      setResult(d);
+      setResult(d); setScenario({ ...nums }); setWhatIfResult(null);
       setHistory(h => [{ prediction: d.prediction, confidence: d.confidence, inputs: { ...nums }, time: new Date().toLocaleTimeString() }, ...h].slice(0, 5));
     } catch (e) { setErr(e.message || "Prediction request failed"); }
     finally { setLoading(false); }
+  }
+
+  async function runWhatIf() {
+    if (!scenario || whatIfBusy) return;
+    setWhatIfBusy(true); setErr("");
+    try {
+      const values = {};
+      feats.forEach(f => { values[f.name] = f.input_type === "categorical" ? scenario[f.name] : Number(scenario[f.name]); });
+      const r = await apiFetch(`/api/whatif/${jobId}`, { method: "POST", body: JSON.stringify({ scenarios: [values] }) }, token);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || "What-if analysis failed");
+      setWhatIfResult(d.results?.[0] || null);
+    } catch(e) { setErr(e.message || "What-if analysis failed"); }
+    finally { setWhatIfBusy(false); }
   }
 
   const label = result?.prediction_label ?? result?.label ?? result?.class_label ?? null;
@@ -1183,18 +1212,18 @@ function PredictPage({ token, jobId, setPage }) {
 
       <div className="card" style={{ padding: "22px 24px" }}>
         <div style={{ display: "flex", justifyContent: "space-between", gap: 12, flexWrap: "wrap", alignItems: "center", marginBottom: 18 }}>
-          <div><h3 style={{ fontSize: 16 }}>Input features</h3><p style={{ fontSize: 11, color: "var(--text3)", marginTop: 3 }}>Values are initialized from the training feature averages, when available.</p></div>
-          {ready && <button className="btn-ghost" onClick={() => { const defaults = {}; feats.forEach(f => { defaults[f.name] = f.input_type === "categorical" ? (f.options?.[0] ?? "") : f.mean != null && Number.isFinite(Number(f.mean)) ? String(Number(Number(f.mean).toFixed(3))) : ""; }); setInputs(defaults); setResult(null); setErr(""); }}>↺ Reset values</button>}
+          <div><h3 style={{ fontSize: 16 }}>Input features</h3><p style={{ fontSize: 11, color: "var(--text3)", marginTop: 3 }}>Defaults come from training data. Review them before predicting; unusual values may be less reliable.</p></div>
+          {ready && <button className="btn-ghost" onClick={() => { const defaults = {}; feats.forEach(f => { defaults[f.name] = f.default != null ? String(f.default) : (f.input_type === "categorical" ? (f.options?.[0] ?? "") : ""); }); setInputs(defaults); setResult(null); setErr(""); }}>↺ Reset values</button>}
         </div>
         {!ready && !err && <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "18px 0", color: "var(--text2)" }}><Spinner /> Loading model metadata…</div>}
         {ready && <>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(min(100%,280px),1fr))", gap: 16 }}>
             {displayed.map(f => {
               const n = Number(inputs[f.name]);
-              const bad = f.input_type === "categorical" ? !f.options?.includes(String(inputs[f.name] ?? "")) : (!String(inputs[f.name] ?? "").trim() || !Number.isFinite(n) || (Number.isFinite(f.min) && n < f.min) || (Number.isFinite(f.max) && n > f.max));
+              const bad = f.input_type === "categorical" ? !f.options?.includes(String(inputs[f.name] ?? "")) : (!String(inputs[f.name] ?? "").trim() || !Number.isFinite(n));
               return <label key={f.name} style={{ display: "block" }}>
                 <span style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 7, fontSize: 12, fontWeight: 600 }}><span>{pretty(f.name)}</span><span className="mono" style={{ fontSize: 10, fontWeight: 400, color: "var(--text3)" }}>{f.input_type === "categorical" ? "Category" : Number.isFinite(f.min) && Number.isFinite(f.max) ? `${f.min.toFixed(1)} – ${f.max.toFixed(1)}` : "Numeric"}</span></span>
-                {f.input_type === "categorical" ? <select className="input" value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad}>{(f.options || []).map(option => <option key={option} value={option}>{option}</option>)}</select> : <input className="input" type="number" step="any" min={Number.isFinite(f.min) ? f.min : undefined} max={Number.isFinite(f.max) ? f.max : undefined} value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad} />}
+                {f.input_type === "categorical" ? <select className="input" value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad}>{(f.options || []).map(option => <option key={option} value={option}>{option}</option>)}</select> : <input className="input" type="number" step="any"  value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad} />}
               </label>;
             })}
           </div>
@@ -1214,6 +1243,42 @@ function PredictPage({ token, jobId, setPage }) {
         {confidencePct != null && <div style={{ marginTop: 20 }}><div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, marginBottom: 8 }}><span>Model confidence for predicted class</span><b className="mono">{confidencePct.toFixed(1)}%</b></div><div style={{ height: 9, borderRadius: 30, background: "var(--border)", overflow: "hidden" }}><div style={{ height: "100%", width: `${confidencePct}%`, background: "var(--accent)", borderRadius: 30, transition: "width .5s ease" }} /></div></div>}
         <div style={{ marginTop: 15, color: "var(--text3)", fontSize: 11 }}>Task: {result.task_type || taskType} · Features used: {result.features_used ?? feats.length}</div>
         <p style={{ marginTop: 9, color: "var(--text3)", fontSize: 11 }}>Model confidence is not a guarantee of correctness. Class names and explanations require metadata from the backend.</p>
+      </div>}
+      {result?.advisor && <div className="card" style={{ padding: "22px 24px", animation: "fadeIn .35s ease" }}>
+        <div style={{ color: "var(--accent)", fontSize: 11, letterSpacing: ".1em", fontWeight: 700, marginBottom: 7 }}>DATAMIND / PREDICTION ADVISOR</div>
+        <h3 style={{ fontSize: 18, marginBottom: 8 }}>Understand your prediction</h3>
+        <p style={{ fontSize: 13, lineHeight: 1.7, color: "var(--text2)", marginBottom: 18 }}>{result.advisor.summary}</p>
+        <h4 style={{ fontSize: 13, marginBottom: 12 }}>Recommended next steps</h4>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(min(100%,230px),1fr))", gap: 12 }}>
+          {(result.advisor.recommendations || []).map((rec, i) => <div key={i} style={{ background: "var(--bg3)", border: "1px solid var(--border)", borderRadius: 12, padding: 16 }}>
+            <div style={{ fontWeight: 700, fontSize: 13, marginBottom: 8 }}>{i + 1}. {rec.title}</div>
+            <p style={{ fontSize: 12, color: "var(--text2)", lineHeight: 1.6 }}>{rec.description}</p>
+            <div style={{ color: "var(--text3)", fontSize: 10, marginTop: 12 }}>Basis: {rec.basis}</div>
+          </div>)}
+        </div>
+        {(result.advisor.warnings || []).length > 0 && <div style={{ marginTop: 15, padding: 14, borderRadius: 10, background: "var(--bg3)", fontSize: 11, color: "var(--text2)" }}>
+          <b>Model reliability notes</b>
+          {(result.advisor.warnings || []).map((warning, i) => <p key={i} style={{ marginTop: 6 }}>• {warning}</p>)}
+        </div>}
+        <p style={{ marginTop: 13, color: "var(--text3)", fontSize: 11 }}>{result.advisor.method}</p>
+      </div>}
+      {result && scenario && <div className="card" style={{ padding: "22px 24px" }}>
+        <div style={{ color: "var(--accent)", fontSize: 11, fontWeight: 700, letterSpacing: ".1em" }}>DATAMIND / WHAT-IF LAB</div>
+        <h3 style={{ marginTop: 8, marginBottom: 5 }}>Explore an alternative scenario</h3>
+        <p style={{ color: "var(--text2)", fontSize: 12, marginBottom: 16 }}>Change one or more inputs and compare the model output. This does not prove a causal effect.</p>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(min(100%,230px),1fr))", gap: 12 }}>
+          {feats.slice(0, 8).map(f => <label key={f.name} style={{ fontSize: 12, fontWeight: 600 }}>
+            {pretty(f.name)}
+            {f.input_type === "categorical" ?
+              <select className="input" style={{ width: "100%", marginTop: 6 }} value={scenario[f.name] ?? ""} onChange={e => setScenario(p => ({...p,[f.name]:e.target.value}))}>{(f.options || []).map(v => <option key={v} value={v}>{v}</option>)}</select> :
+              <input className="input" style={{ width: "100%", marginTop: 6 }} type="number" step="any" value={scenario[f.name] ?? ""} onChange={e => setScenario(p => ({...p,[f.name]:e.target.value}))} />}
+          </label>)}
+        </div>
+        {feats.length > 8 && <p style={{ color: "var(--text3)", fontSize: 11, marginTop: 12 }}>Showing the first 8 fields; remaining fields retain the original prediction values.</p>}
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginTop: 16 }}>
+          <button className="btn-primary" onClick={runWhatIf} disabled={whatIfBusy}>{whatIfBusy ? "Comparing…" : "Compare scenario"}</button>
+          {whatIfResult && <div style={{ fontSize: 13 }}>Original: <b>{String(result.prediction)}</b> &nbsp; → &nbsp; Scenario: <b style={{ color: "var(--accent)" }}>{String(whatIfResult.prediction)}</b></div>}
+        </div>
       </div>}
       {history.length > 0 && <div className="card" style={{ padding: "20px 24px" }}><h3 style={{ fontSize: 15, marginBottom: 12 }}>Recent predictions <span style={{ color: "var(--text3)", fontSize: 11, fontWeight: 400 }}>(this session)</span></h3>{history.map((h, i) => <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "10px 0", borderTop: "1px solid var(--border)", gap: 10, fontSize: 12 }}><span style={{ color: "var(--text2)" }}>{h.time}</span><b>{String(h.prediction)}</b><button className="btn-ghost" style={{ padding: "4px 9px", fontSize: 11 }} onClick={() => { setInputs(Object.fromEntries(Object.entries(h.inputs).map(([k,v]) => [k,String(v)]))); setResult(null); }}>Reuse inputs</button></div>)}</div>}
     </div>
@@ -1322,9 +1387,11 @@ function ReportPage({ token, jobId, jobResult, setPage }) {
   const ml    = jobResult.ml_recommendation || {};
   const stats = jobResult.stats || {};
   const rep   = jobResult.analysis_data || jobResult;
+  const reportNote = "Reports summarize the completed analysis. Prediction Advisor recommendations are exploratory and should be validated before decisions.";
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 16, animation: "fadeIn .2s ease" }}>
+      <div className="card" style={{padding:14,fontSize:12,color:"var(--text2)"}}>{reportNote}</div>
       <div className="card" style={{ padding: 16 }}>
         <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 12 }}>Analysis Report</div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 10, marginBottom: 16 }}>
@@ -1401,7 +1468,7 @@ function HistoryPage({ token, setPage }) {
 
   if (runs === null) return <div style={{ padding: 40, textAlign: "center" }}><Spinner size={20} /></div>;
   if (runs.length === 0) {
-    return <Empty icon="📈" title="No analysis history yet" sub="Every completed run gets logged here automatically — run an analysis to start building a track record." action="⬆ Upload Dataset" onAction={() => setPage("upload")} />;
+    return <Empty icon="📈" title="No analysis history yet" sub="Run an analysis to begin. History availability depends on server storage and deployment configuration." action="⬆ Upload Dataset" onAction={() => setPage("upload")} />;
   }
 
   const chartData = [...runs].reverse().map((r, i) => ({
@@ -1480,13 +1547,13 @@ function DashboardPage({ jobResult, jobStep, jobStatus, jobStepHistory, setPage 
           <div style={{ fontSize: 42, marginBottom: 14 }}>🧠</div>
           <div style={{ fontSize: 18, fontWeight: 600, letterSpacing: "-0.3px", marginBottom: 8 }}>Welcome to DataMind AI</div>
           <div style={{ fontSize: 13, color: "var(--text3)", marginBottom: 24, lineHeight: 1.6 }}>
-            Upload a CSV or Excel dataset to start your AI-powered analysis.<br/>
+            Upload CSV, TSV or Excel data to start your AI-powered analysis.<br/>
             Four intelligent agents will clean, analyse, model, and summarise your data.
           </div>
           <button className="btn-primary" onClick={() => setPage("upload")}>⬆ Upload Dataset</button>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
-          {[["🔍","Data Detective","Cleans & profiles your CSV automatically"],["🧠","AI Analyst","Groq LLaMA 3.3 70B generates business insights"],["⚙️","ML Engineer","Trains & compares 5+ ML models with SHAP"],["📝","Reporter","Writes plain-English executive summaries"]].map(([i,t,d]) => (
+          {[["🔍","Data Detective","Cleans & profiles your CSV automatically"],["🧠","AI Analyst","Produces dataset-grounded insights when AI services are available"],["⚙️","ML Engineer","Trains & compares 5+ ML models with SHAP"],["📝","Reporter","Writes plain-English executive summaries"]].map(([i,t,d]) => (
             <div key={t} className="card" style={{ padding: "14px 16px" }}>
               <div style={{ fontSize: 24, marginBottom: 8 }}>{i}</div>
               <div style={{ fontSize: 12, fontWeight: 500, marginBottom: 4 }}>{t}</div>
