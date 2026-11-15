@@ -821,6 +821,65 @@ def explore(job_id):
 # PREDICT
 # ══════════════════════════════════════════════════════════════════
 
+def _prediction_rows(payloads, feature_cols, artifacts=None):
+    """Validate exact model input order; never silently substitute zero."""
+    rows = []
+    mappings = (artifacts or {}).get("categorical_mappings", {})
+    for idx, values in enumerate(payloads):
+        if not isinstance(values, dict):
+            raise ValueError(f"Scenario {idx + 1}: inputs must be an object")
+        missing = [col for col in feature_cols if col not in values or values[col] is None or str(values[col]).strip() == ""]
+        if missing:
+            raise ValueError(f"Scenario {idx + 1}: missing features: {', '.join(missing[:12])}")
+        row = []
+        for col in feature_cols:
+            raw = values[col]
+            if col in mappings:
+                options = mappings[col]
+                if str(raw) not in options:
+                    raise ValueError(f"Scenario {idx + 1}: {col} must be one of: {', '.join(options[:12])}")
+                value = float(options.index(str(raw)))
+            else:
+                try:
+                    value = float(raw)
+                except (TypeError, ValueError, OverflowError):
+                    raise ValueError(f"Scenario {idx + 1}: {col} must be numeric")
+            if not np.isfinite(value):
+                raise ValueError(f"Scenario {idx + 1}: {col} must be finite")
+            row.append(value)
+        rows.append(row)
+    return np.asarray(rows, dtype=float)
+
+
+def _prediction_output(pred_raw, artifacts):
+    task_type = artifacts.get("task_type", "regression")
+    le_target = artifacts.get("le_target")
+    if task_type == "classification":
+        if le_target is not None:
+            pred = le_target.inverse_transform([int(pred_raw)])[0]
+        else:
+            pred = pred_raw
+        return _safe_val(pred)
+    return round(float(pred_raw), 4)
+
+
+def _prediction_probabilities(model, X_scaled, artifacts):
+    if artifacts.get("task_type") != "classification" or not hasattr(model, "predict_proba"):
+        return None, None
+    probs = model.predict_proba(X_scaled)
+    classes = getattr(model, "classes_", list(range(probs.shape[1])))
+    le_target = artifacts.get("le_target")
+    labels = []
+    for value in classes:
+        if le_target is not None:
+            try:
+                value = le_target.inverse_transform([int(value)])[0]
+            except (ValueError, IndexError, TypeError):
+                pass
+        labels.append(str(_safe_val(value)))
+    return [{label: round(float(prob) * 100, 2) for label, prob in zip(labels, row)} for row in probs], [round(float(max(row)) * 100, 1) for row in probs]
+
+
 @app.route("/api/predict/<job_id>", methods=["POST"])
 def predict(job_id):
     job, err = _get_owned_job(job_id, require_done=True)
@@ -828,31 +887,26 @@ def predict(job_id):
     artifacts = job["result"].get("ml_artifacts", {})
     model, scaler = artifacts.get("model"), artifacts.get("scaler")
     feat_cols = artifacts.get("feature_cols", [])
-    task_type = artifacts.get("task_type", "regression")
-    le_target = artifacts.get("le_target")
     if model is None or not feat_cols:
-        return jsonify({"error": "No trained model available"}), 500
-    inputs = request.get_json(force=True).get("inputs", {})
+        return jsonify({"error": "No trained model available"}), 422
+    payload = request.get_json(silent=True) or {}
     try:
-        row = []
-        for col in feat_cols:
-            try: row.append(float(inputs.get(col, 0)))
-            except: row.append(0.0)
-        X_scaled = scaler.transform(np.array([row]))
+        X = _prediction_rows([payload.get("inputs")], feat_cols, artifacts)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
+        X_scaled = scaler.transform(X) if scaler is not None else X
         pred_raw = model.predict(X_scaled)[0]
-        if task_type == "classification" and le_target is not None:
-            pred_label = le_target.inverse_transform([int(pred_raw)])[0]
-        else:
-            pred_label = round(float(pred_raw), 4)
-        confidence = None
-        if hasattr(model, "predict_proba"):
-            confidence = round(float(max(model.predict_proba(X_scaled)[0])) * 100, 1)
-        return jsonify({"prediction": pred_label, "confidence": confidence,
-                        "task_type": task_type, "target": artifacts.get("target_column"),
-                        "features_used": len(feat_cols)})
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+        prediction = _prediction_output(pred_raw, artifacts)
+        probs, confidence = _prediction_probabilities(model, X_scaled, artifacts)
+        return jsonify({"prediction": prediction, "prediction_label": str(prediction),
+                        "confidence": confidence[0] if confidence else None,
+                        "class_probabilities": probs[0] if probs else None,
+                        "task_type": artifacts.get("task_type", "regression"),
+                        "target": artifacts.get("target_column"), "features_used": len(feat_cols)})
+    except Exception:
+        logger.exception("Prediction failed for job %s", job_id)
+        return jsonify({"error": "Prediction failed. Check the trained model and feature encoding."}), 500
 
 
 @app.route("/api/predict_info/<job_id>")
@@ -864,14 +918,25 @@ def predict_info(job_id):
     feat_cols = artifacts.get("feature_cols", [])
     col_stats = ctx.get("column_stats", {})
     features = []
+    mappings = artifacts.get("categorical_mappings", {})
     for col in feat_cols:
         st = col_stats.get(col, {})
-        features.append({"name": col, "min": st.get("min", 0), "max": st.get("max", 100),
-                         "mean": st.get("mean", 0), "median": st.get("median", 0)})
+        if col in mappings:
+            features.append({"name": col, "input_type": "categorical", "options": mappings[col]})
+        else:
+            features.append({"name": col, "min": _safe_val(st.get("min")),
+                             "max": _safe_val(st.get("max")),
+                             "mean": _safe_val(st.get("mean")),
+                             "median": _safe_val(st.get("median")),
+                             "input_type": "numeric"})
+    le_target = artifacts.get("le_target")
+    classes = [str(_safe_val(v)) for v in le_target.classes_] if le_target is not None else None
     return jsonify({"features": features, "task_type": artifacts.get("task_type", "regression"),
                     "target": artifacts.get("target_column", ""),
                     "best_model": artifacts.get("best_model", ""),
-                    "best_score": artifacts.get("best_score", 0)})
+                    "best_score": _safe_val(artifacts.get("best_score", 0)),
+                    "class_labels": classes,
+                    "feature_encoding": "categorical_labels_or_numeric_features"})
 
 
 @app.route("/api/whatif/<job_id>", methods=["POST"])
@@ -881,28 +946,33 @@ def whatif(job_id):
     artifacts = job["result"].get("ml_artifacts", {})
     model, scaler = artifacts.get("model"), artifacts.get("scaler")
     feat_cols = artifacts.get("feature_cols", [])
-    task_type = artifacts.get("task_type", "regression")
-    le_target = artifacts.get("le_target")
     if model is None or not feat_cols:
-        return jsonify({"error": "No trained model"}), 500
-    scenarios = request.get_json(force=True).get("scenarios", [])
-    if not scenarios:
-        return jsonify({"error": "No scenarios provided"}), 400
+        return jsonify({"error": "No trained model available"}), 422
+    payload = request.get_json(silent=True) or {}
+    scenarios = payload.get("scenarios")
+    if not isinstance(scenarios, list) or not scenarios:
+        return jsonify({"error": "scenarios must be a nonempty list"}), 400
+    if len(scenarios) > 50:
+        return jsonify({"error": "Maximum 50 scenarios per request"}), 400
     try:
-        rows = [[float(sc.get(col, 0)) for col in feat_cols] for sc in scenarios]
-        X_scaled = scaler.transform(np.array(rows))
-        preds_raw = model.predict(X_scaled)
+        X = _prediction_rows(scenarios, feat_cols, artifacts)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    try:
+        X_scaled = scaler.transform(X) if scaler is not None else X
+        predictions = model.predict(X_scaled)
+        probs, confidences = _prediction_probabilities(model, X_scaled, artifacts)
         results = []
-        for i, pred_raw in enumerate(preds_raw):
-            if task_type == "classification" and le_target is not None:
-                pred_label = le_target.inverse_transform([int(pred_raw)])[0]
-            else:
-                pred_label = round(float(pred_raw), 4)
-            results.append({"scenario": i + 1, "prediction": pred_label})
+        for i, pred in enumerate(predictions):
+            item = {"scenario": i + 1, "prediction": _prediction_output(pred, artifacts)}
+            if confidences is not None:
+                item["confidence"] = confidences[i]
+                item["class_probabilities"] = probs[i]
+            results.append(item)
         return jsonify({"results": results})
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        logger.exception("What-if prediction failed for job %s", job_id)
+        return jsonify({"error": "What-if prediction failed. Check model feature encoding."}), 500
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1386,6 +1456,7 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
             "best_score":    ml.get("best_score", 0),
             "le_target":     ml.get("_le_target"),
             "numeric_cols":  ml.get("_numeric_cols", []),
+            "categorical_mappings": ml.get("_categorical_mappings", {}),
         }
 
         ml_rec = ana.get("ml_recommendation", {})
