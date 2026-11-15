@@ -147,7 +147,7 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
     best_model_data = next((m for m in ml.get("models", []) if m.get("is_best")), {})
     cv_score = (best_model_data.get("metrics") or {}).get("cv_score", 0)
     cv_std   = (best_model_data.get("metrics") or {}).get("cv_std", 0)
-    cv_str   = f"{round(cv_score * 100, 1)}% ± {round(cv_std * 100, 1)}%" if cv_score else "not available"
+    cv_str   = (f"{cv_score:.3f} ± {cv_std:.3f} (cross-validation score)" if cv_score is not None else "not available")
 
     insights_text = "; ".join([
         f"{i.get('title','')}: {i.get('description','')}"
@@ -193,9 +193,10 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
         headline = f"No reliable model found for '{target}' ({score_str})"
         score_meaning = f"{score_str} means the model has no usable predictive skill for '{target}' on this data. Cross-validation: {cv_str}."
     else:
-        body = f"The predictive model achieved {score_str}, meaning it can reliably forecast future outcomes."
-        headline = f"Your data is ready — AI model achieves {score_str}"
-        score_meaning = f"The model correctly predicts '{target}' with {score_str}. Cross-validation: {cv_str}."
+        body = (f"The model achieved {score_str} on the evaluation data. This describes observed model fit, "
+                f"not prediction confidence or proof of reliable future forecasts. Independent validation is recommended.")
+        headline = f"Model evaluation for '{target}': {score_str}"
+        score_meaning = f"Hold-out {score_str}. Cross-validation: {cv_str}. Validate on more representative data."
 
     fallback = {
         "report": (
@@ -210,7 +211,7 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
         "risk_flags": [w.get("message", "") for w in ana.get("warning_flags", [])[:3]],
         "confidence": "high" if best_score > 0.8 and quality > 85 else ("medium" if best_score > 0.6 else "low"),
         "should_i_worry": (
-            "No — your data quality is solid and the model performs well. You can act on these insights confidently."
+            "Data quality checks are encouraging, but model performance and external validation must be reviewed before operational decisions."
             if risk_score < 30
             else f"Yes — there are {warning_count} flag(s) to address before fully trusting predictions. See risk flags."
         ),
