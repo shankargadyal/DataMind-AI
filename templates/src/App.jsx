@@ -4,6 +4,26 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
 } from "recharts";
 
+// Render basic Markdown as React nodes, never as unsanitized HTML.
+function RichText({ text }) {
+  const lines = String(text ?? "").split(/\n/);
+  return <div style={{whiteSpace:"normal",overflowWrap:"anywhere"}}>{lines.map((line,i) => {
+    const tokens = line.split(/(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\(https?:\/\/[^\s)]+\))/g);
+    return <React.Fragment key={i}>{i > 0 && <br/>}{tokens.map((token,j) => {
+      if (token.startsWith("**") && token.endsWith("**")) return <strong key={j}>{token.slice(2,-2)}</strong>;
+      if (token.startsWith("`") && token.endsWith("`")) return <code key={j} style={{background:"var(--accent-bg)",padding:"1px 4px",borderRadius:4}}>{token.slice(1,-1)}</code>;
+      const m = token.match(/^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/);
+      if (m) return <a key={j} href={m[2]} target="_blank" rel="noopener noreferrer">{m[1]}</a>;
+      return <React.Fragment key={j}>{token}</React.Fragment>;
+    })}</React.Fragment>;
+  })}</div>;
+}
+
+const datasetDownloadName = (filename, suffix, extension) => {
+  const base = String(filename || "dataset").replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]+/g,"_").slice(0,80) || "dataset";
+  return `${base}_${suffix}.${extension}`;
+};
+
 // ─── CONFIG ──────────────────────────────────────────────────────
 // Use the same machine hostname as the frontend, but talk to Flask on port 5000.
 const API_BASE =
@@ -188,6 +208,16 @@ const CSS = `
   @media(min-width:851px){.dm-laptop{animation:dmFloat3D 9s ease-in-out infinite;transform-style:preserve-3d}.dm-auth-card{animation:dmReveal .9s ease-out both;box-shadow:0 30px 85px rgba(92,47,11,.14),inset 0 1px 0 rgba(255,255,255,.85)}.dm-story-content{animation:dmReveal .8s ease-out both}}
   @media(prefers-reduced-motion:reduce){.dm-login *{scroll-behavior:auto!important;animation:none!important;transition:none!important}}
 
+
+  /* v3.1 visual refinements: quiet depth, responsive cards, accessible motion */
+  .card{transition:box-shadow .22s ease,transform .22s ease,border-color .22s ease;}
+  .card:hover{box-shadow:0 12px 32px rgba(36,28,17,.09);}
+  .nav-item:focus-visible,.btn-primary:focus-visible,.btn-ghost:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+  .dm-laptop{transform:perspective(1100px) rotateY(-9deg) rotateX(5deg);transform-style:preserve-3d;transition:transform .6s cubic-bezier(.2,.7,.2,1);filter:drop-shadow(0 24px 30px rgba(80,47,12,.18));}
+  .dm-laptop:hover{transform:perspective(1100px) rotateY(0deg) rotateX(0deg) translateY(-5px);}
+  .dm-login-inner{perspective:1200px;}
+  @media (max-width:900px){.dm-laptop{transform:none;}}
+  @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important;scroll-behavior:auto!important;}}
 `;
 
 // ─── UTILS ────────────────────────────────────────────────────────
@@ -753,6 +783,10 @@ function InsightsPage({ jobResult, setPage }) {
       </div>
 
       {/* Summary */}
+      {ml.task_type === "regression" && Number.isFinite(Number(ml.best_score)) && Number(ml.best_score) < 0.5 && <div className="card" role="status" style={{padding:14,borderLeft:"3px solid var(--warning)",background:"var(--warning-bg)",fontSize:12}}>
+        <b>Model reliability notice:</b> R² = {Number(ml.best_score).toFixed(3)} indicates limited explained variance on the evaluation split. Any optimistic wording in an AI-generated summary should not be interpreted as proof of reliable forecasting.
+      </div>}
+      {/* Summary */}
       {jobResult.summary && (
         <div className="card" style={{ padding: 16 }}>
           <div style={{ fontSize: 13, fontWeight: 500, marginBottom: 10 }}>Executive Summary</div>
@@ -1002,6 +1036,9 @@ function MLResultsPage({ jobResult, setPage }) {
         <b style={{fontSize:13}}>Model evaluation notes</b>
         {ml.evaluation_warnings.slice(0,5).map((w,i)=><p key={i} style={{fontSize:12,marginTop:7,lineHeight:1.5}}>{w}</p>)}
       </div>}
+      {ml.task_type === "regression" && Number.isFinite(Number(ml.best_score)) && Number(ml.best_score) < 0.5 && <div className="card" role="status" style={{padding:15,borderLeft:"3px solid var(--warning)",background:"var(--warning-bg)",fontSize:12,lineHeight:1.6}}>
+        <b>Limited predictive performance.</b> Hold-out R² = {Number(ml.best_score).toFixed(3)}. Predictions are exploratory estimates, not reliable forecasts. {Number(jobResult?.stats?.total_rows || 0) < 100 ? "The dataset is small; evaluation scores may vary substantially." : "Validate on independent data before decisions."}
+      </div>}
       {ml.class_imbalance?.imbalanced && <div className="card" style={{padding:14,fontSize:12,color:"var(--text2)"}}>⚠ Class imbalance detected. Review per-class recall and macro F1; accuracy alone can be misleading.</div>}
       {/* Best model banner */}
       {ml.best_model && (
@@ -1030,7 +1067,7 @@ function MLResultsPage({ jobResult, setPage }) {
             ? [["Accuracy","accuracy",true],["F1 (weighted)","f1",true],["F1 (macro)","f1_macro",true],["Precision (weighted)","precision",true],["Recall (weighted)","recall",true]].map(([l,k,pct]) => (
                 <KpiCard key={k} label={l} value={bm[k] != null ? (pct ? `${(bm[k]*100).toFixed(1)}%` : bm[k].toFixed(4)) : "—"} />
               ))
-            : [["R² Score","r2",false],["MAE","mae",false],["RMSE","rmse",false],["CV Score","cv_score",true]].map(([l,k,pct]) => (
+            : [["R² Score","r2",false],["MAE","mae",false],["RMSE","rmse",false],["CV R²","cv_score",false]].map(([l,k,pct]) => (
                 <KpiCard key={k} label={l} value={bm[k] != null ? (pct ? `${(bm[k]*100).toFixed(1)}%` : bm[k].toFixed(4)) : "—"} />
               ))
           }
@@ -1332,7 +1369,7 @@ function ChatPage({ token, jobId }) {
         borderBottomRightRadius: m.role === "user" ? 2 : 10,
         borderBottomLeftRadius:  m.role === "user" ? 10 : 2,
       }}>
-        {m.content}
+        <RichText text={m.content} />
       </div>
     </div>
   );
@@ -1377,7 +1414,9 @@ function ReportPage({ token, jobId, jobResult, setPage }) {
       if (!r.ok) { alert(type === "pdf" ? "PDF failed — install reportlab: pip install reportlab" : "CSV not found"); return; }
       const blob = await r.blob();
       const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-      a.download = type === "pdf" ? "DataMind_Report.pdf" : "cleaned_dataset.csv"; a.click();
+      a.download = datasetDownloadName(jobResult?.filename, type === "pdf" ? "DataMind_Report" : "cleaned", type === "pdf" ? "pdf" : "csv");
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 60000);
     } catch (e) { alert("Download error: " + e.message); }
     finally { if (type === "pdf") setDlPDF(false); else setDlCSV(false); }
   }
@@ -1399,7 +1438,7 @@ function ReportPage({ token, jobId, jobResult, setPage }) {
             ["Dataset",  jobResult.filename || "—"],
             ["Rows",     (stats.total_rows || 0).toLocaleString()],
             ["Quality",  `${stats.quality_score || 0}%`],
-            ["Model",    ml.best_model?.split(" ").slice(-1)[0] || "—"],
+            ["Model",    ml.best_model || "—"],
             ["Score",    formatScore(ml.best_score, ml.task_type)],
             ["Task",     ml.task_type || "—"],
           ].map(([l, v]) => (
@@ -1571,7 +1610,7 @@ function DashboardPage({ jobResult, jobStep, jobStatus, jobStepHistory, setPage 
         <KpiCard label="Rows Analysed" value={(stats.total_rows || 0).toLocaleString()} />
         <KpiCard label="Columns"       value={stats.total_cols || 0} />
         <KpiCard label="Data Quality"  value={`${stats.quality_score || 0}%`} />
-        <KpiCard label="Best Model"    value={ml.best_model?.split(" ").slice(-1)[0] || "—"} sub={formatScore(ml.best_score, ml.task_type)} highlight />
+        <KpiCard label="Best Model"    value={ml.best_model || "—"} sub={formatScore(ml.best_score, ml.task_type)} highlight />
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1.6fr", gap: 12 }}>
@@ -1636,8 +1675,8 @@ function AppShell({ user, token, onLogout }) {
           {page === "insights"  && <InsightsPage  jobResult={jobResult} setPage={setPage} />}
           {page === "charts"    && <ChartsPage    jobResult={jobResult} setPage={setPage} />}
           {page === "ml"        && <MLResultsPage jobResult={jobResult} setPage={setPage} />}
-          {page === "predict"   && <PredictPage   token={token} jobId={jobId} setPage={setPage} />}
-          {page === "chat"      && <ChatPage      token={token} jobId={jobId} />}
+          <div style={{display:page === "predict" ? "block" : "none"}}><PredictPage key={jobId || "empty"} token={token} jobId={jobId} setPage={setPage} /></div>
+          <div style={{display:page === "chat" ? "block" : "none"}}><ChatPage key={jobId || "empty"} token={token} jobId={jobId} /></div>
           {page === "report"    && <ReportPage    token={token} jobId={jobId} jobResult={jobResult} setPage={setPage} />}
           {page === "history"   && <HistoryPage   token={token} setPage={setPage} />}
         </div>
