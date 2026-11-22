@@ -225,3 +225,57 @@ This project is licensed under the MIT License.
 ----
 
 Made with ❤️ by Shankar Gadyal
+
+## Evaluation and prediction-time features (v3.2)
+
+The hold-out set is split before fitted transformations. The scikit-learn
+pipeline fits imputation, categorical encoding and scaling independently
+in each training fold. Classification stratifies when class support permits.
+The winner maximizes training cross-validation accuracy, or macro F1 when
+the smallest training class is under 70% of the largest. Regression selects
+by cross-validation R². Chronological regression uses a time-ordered split
+and forward-chaining validation. The leaderboard shows hold-out results.
+Runs that cannot support the evaluation report that limitation.
+
+Experiment history records the source-file SHA-256, requested and effective
+targets, evaluation protocol, test fraction and actual sample sizes, random
+seed, CV settings, and package versions. Improved preprocessing can change
+scores and winning estimators. Historical metrics belong to their original
+run and evaluation protocol.
+
+For an availability comparison, send the optional multipart field
+`feature_availability` to `POST /api/analyze`. Its value is a JSON object
+from column names to human-readable prediction-time explanations. Example:
+
+```json
+{"duration": "Available after the call; pre-call scoring must exclude it."}
+```
+
+The Bank Marketing schema sets this flag for `duration` by default. The
+primary model includes eligible predictors. The comparison excludes the
+flagged predictors and their engineered derivatives, uses the same split
+and candidate models, and reports both sets of metrics in ML Results and
+the PDF. The alert concerns feature timing. The existing leakage checks
+still report potential target-derived relationships separately.
+
+Guardrail settings use fractions. Defaults and environment overrides:
+
+| Setting | Default | Environment variable |
+| --- | ---: | --- |
+| Approximate equality band | 0.001 (0.1 percentage points) | `DATAMIND_BASELINE_EQUAL_BAND` |
+| Substantial gain | 0.02 (2 percentage points) | `DATAMIND_BASELINE_SUBSTANTIAL_GAIN` |
+| Minimum positive-class recall | 0.60 | `DATAMIND_MIN_POSITIVE_RECALL` |
+| Minimum minority-to-majority support ratio | 0.30 | `DATAMIND_MINORITY_RATIO` |
+
+The baseline is the largest actual class share in the hold-out. Guardrails
+compare the unrounded accuracy delta and also assess macro F1, recall and
+class support. Approval permits access to predictions and exports while
+retaining the original findings.
+
+Run the reliability tests with:
+
+```bash
+python -m pip install -r requirements-dev.txt
+python -m pytest -q
+node --test templates/tests/analysisSession.test.js
+```

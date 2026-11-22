@@ -9,13 +9,15 @@ New in v3:
 """
 import json
 import re
+from agents.analysis_evidence import qualitative_text_is_safe
 
 
 _REPORT_PROMPT = """You are a trusted business advisor writing a report for a non-technical business owner.
 Based on the analysis results below, write a clear, friendly executive report.
 
 Dataset: {filename}
-Data Quality: {quality}%
+Composite data-quality score: {quality}/100
+Data completeness: {completeness}
 Rows analysed: {rows}
 Task: {task_type} — predicting '{target}'
 Best model: {best_model} (score: {score_str}, cross-validation: {cv_str})
@@ -49,7 +51,8 @@ Rules:
 _EDA_REPORT_PROMPT = """You are a data analyst explaining exploratory analysis to a non-technical business owner.
 
 Dataset: {filename}
-Data Quality: {quality}%
+Composite data-quality score: {quality}/100
+Data completeness: {completeness}
 Rows analysed: {rows}
 Key insights: {insights}
 Domain: {domain}
@@ -73,7 +76,8 @@ Return this JSON:
 _CLUSTERING_REPORT_PROMPT = """You are a data analyst explaining customer/record segmentation to a non-technical business owner.
 
 Dataset: {filename}
-Data Quality: {quality}%
+Composite data-quality score: {quality}/100
+Data completeness: {completeness}
 Rows analysed: {rows}
 Segments found: {best_model} (silhouette score: {score_str} — closer to 1.0 means more clearly separated segments)
 Key insights: {insights}
@@ -97,7 +101,8 @@ Return this JSON:
 _FORECASTING_REPORT_PROMPT = """You are a data analyst explaining a time-series forecast to a non-technical business owner.
 
 Dataset: {filename}
-Data Quality: {quality}%
+Composite data-quality score: {quality}/100
+Data completeness: {completeness}
 Rows analysed: {rows}
 Forecasting target: '{target}'
 Best model: {best_model} (backtest error: {score_str} — lower is better)
@@ -122,14 +127,17 @@ Return this JSON:
 
 def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_id: str = None, user_email: str = None) -> dict:
     filename    = det.get("filename", "") or "dataset"
-    quality     = det.get("quality_score", 0)
+    quality_data = det.get("quality_dimensions", {})
+    quality = quality_data.get("composite_score", det.get("quality_score", 0))
+    completeness = quality_data.get("dimensions", {}).get("completeness")
+    completeness_text = f"{completeness:g}%" if completeness is not None else "unavailable"
     rows        = det.get("original_shape", [0])[0]
-    task_type   = ml.get("task_type", "regression")
+    task_type   = ml.get("task_type") or "exploratory"
     target      = ml.get("target_column", "outcome")
     best_model  = ml.get("best_model", "AI model")
-    best_score  = ml.get("best_score", 0)
+    best_score  = ml.get("best_score") or 0
     domain      = ana.get("domain", "business")
-    exploratory = ml.get("exploratory_mode", False)
+    exploratory = ml.get("exploratory_mode", False) or task_type == "exploratory"
 
     # Score string
     if task_type == "classification":
@@ -180,6 +188,10 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
         body = f"The AI forecasted '{target}' forward using {best_model} ({score_str} on backtesting)."
         headline = f"Forecast ready for '{target}' — {best_model}"
         score_meaning = f"The backtest error ({score_str}) shows how far off the model's predictions were on recent known data — lower is more trustworthy."
+    elif not best_model_data:
+        body = f"Model evaluation for '{target}' is unavailable."
+        headline = "Model evaluation unavailable"
+        score_meaning = "This run did not produce hold-out model results."
     elif task_type == "regression" and best_score <= 0:
         # R2 <= 0 is no better than always predicting the mean -- the model has no real predictive skill,
         # so the fallback text must not claim it "reliably" forecasts anything (this was previously
@@ -198,27 +210,28 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
         headline = f"Model evaluation for '{target}': {score_str}"
         score_meaning = f"Hold-out {score_str}. Cross-validation: {cv_str}. Validate on more representative data."
 
+    metrics = best_model_data.get("metrics", {})
+    next_steps = list(quality_data.get("recommendations", []))
+    if metrics.get("positive_recall") is not None and metrics["positive_recall"] < 0.60:
+        next_steps.append("Review missed positive cases and assess their operational cost.")
+    if ml.get("feature_availability"):
+        next_steps.append("Use the restricted comparison for decisions made before the flagged features become available.")
+    if not next_steps:
+        next_steps.append("Check hold-out errors against the intended use case." if best_model_data
+                          else "Review the data profile before selecting a prediction outcome.")
     fallback = {
         "report": (
-            f"Your {filename} dataset contains {rows:,} records with a data quality score of {quality}%. "
-            f"The AI has analysed your data and identified key patterns to help your business. " + body
+            f"The uploaded dataset contains {rows:,} records. Composite data-quality score: {quality}/100. "
+            f"Data completeness: {completeness_text}. " + body
         ),
         "headline": headline,
         "score_meaning": score_meaning,
-        "top_recommendation": (
-            (ana.get("actions", [{}])[0].get("action") if ana.get("actions") else "Review the key insights above.")
-        ),
-        "risk_flags": [w.get("message", "") for w in ana.get("warning_flags", [])[:3]],
-        "confidence": "high" if best_score > 0.8 and quality > 85 else ("medium" if best_score > 0.6 else "low"),
-        "should_i_worry": (
-            "Data quality checks are encouraging, but model performance and external validation must be reviewed before operational decisions."
-            if risk_score < 30
-            else f"Yes — there are {warning_count} flag(s) to address before fully trusting predictions. See risk flags."
-        ),
+        "top_recommendation": next_steps[0],
+        "risk_flags": [item for item in next_steps if item.startswith("Review missed")],
+        "confidence": "medium" if best_model_data and quality > 70 else "low",
+        "should_i_worry": "Review data quality, hold-out performance, and timing assumptions before operational use.",
         "risk_score": risk_score,
-        "next_steps": [
-            a.get("action", "") for a in ana.get("actions", [])[:3]
-        ] or ["Review insights", "Check warning flags", "Export the report"],
+        "next_steps": list(dict.fromkeys(next_steps)),
         "generated_by": "fallback",
         "degraded_mode": True,
     }
@@ -235,7 +248,7 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
     else:
         prompt_template = _REPORT_PROMPT
     prompt = prompt_template.format(
-        filename=filename, quality=quality, rows=rows,
+        filename=filename, quality=quality, completeness=completeness_text, rows=rows,
         task_type=task_type, target=target,
         best_model=best_model, score_str=score_str, cv_str=cv_str,
         insights=insights_text, actions=actions_text,
@@ -253,7 +266,7 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
                 max_tokens=1000,
                 temperature=0.4,
                 messages=[
-                    {"role": "system", "content": "You are a business advisor. Return only valid JSON, no markdown."},
+                    {"role": "system", "content": "Return JSON. The report field is qualitative interpretation only. Omit numerical claims, scores, target claims, causation and guarantees."},
                     {"role": "user",   "content": prompt},
                 ],
             )
@@ -263,14 +276,13 @@ def run_reporter(det: dict, ana: dict, ml: dict, query: str, api_key: str, job_i
         raw = re.sub(r"^```\s*", "", raw)
         raw = re.sub(r"\s*```$", "", raw)
         result = json.loads(raw)
-        for k in fallback:
-            if k not in result:
-                result[k] = fallback[k]
-        # Always derive risk_score from our logic (more reliable than LLM)
-        result["risk_score"] = risk_score
-        result["generated_by"] = "groq"
-        result["degraded_mode"] = False
-        return result
+        interpretation = result.get("report", "")
+        if (not isinstance(interpretation, str) or not interpretation.strip()
+                or not qualitative_text_is_safe(interpretation)
+                or re.search(r"quality|completeness|accuracy|precision|recall|f1|baseline|\btarget\b|\bmodel\b", interpretation, re.I)):
+            return fallback
+        return {**fallback, "report": fallback["report"] + "\n\nAI interpretation: " + interpretation.strip(),
+                "generated_by": "groq", "degraded_mode": False}
     except Exception as e:
         print(f"[Reporter] Error: {e}")
         return fallback

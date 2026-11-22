@@ -60,11 +60,14 @@ class ExperimentRun(db.Model):
 
     total_duration  = db.Column(db.Float)             # seconds, from the pipeline timing (see app.py set_step)
 
+    evidence = db.relationship("ExperimentEvaluation", uselist=False, cascade="all, delete-orphan", lazy="selectin")
+
     def to_dict(self):
         return {
             "id": self.id,
             "job_id": self.job_id,
             "filename": self.filename,
+            "evaluation": self.evidence.settings if self.evidence else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "mode": self.mode,
             "task_type": self.task_type,
@@ -78,6 +81,14 @@ class ExperimentRun(db.Model):
             "scoring_metric": self.scoring_metric,
             "total_duration": self.total_duration,
         }
+
+
+class ExperimentEvaluation(db.Model):
+    """Versioned metadata alongside older history rows without a schema rewrite."""
+    __tablename__ = "experiment_evaluations"
+
+    run_id = db.Column(db.Integer, db.ForeignKey("experiment_runs.id"), primary_key=True)
+    settings = db.Column(db.JSON, nullable=False)
 
 
 class LLMCallLog(db.Model):
@@ -131,8 +142,10 @@ def create_user(name: str, email: str, password_hash: str) -> User:
     return user
 
 
-def log_experiment_run(**fields) -> ExperimentRun:
+def log_experiment_run(evaluation=None, **fields) -> ExperimentRun:
     run = ExperimentRun(**fields)
+    if evaluation:
+        run.evidence = ExperimentEvaluation(settings=evaluation)
     db.session.add(run)
     db.session.commit()
     return run

@@ -83,7 +83,7 @@ def load_meta(folder: str, job_id: str) -> dict | None:
 
 
 def owner_allowed(meta: dict, user_email: str) -> bool:
-    return meta.get("user") in ("guest@datamind.ai", user_email)
+    return meta.get("user") == user_email
 
 
 def get_dataframe(folder: str, job_id: str, user_email: str, kind: str = "raw"):

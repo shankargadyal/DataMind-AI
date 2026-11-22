@@ -51,7 +51,7 @@ def _kpi_cards(det: dict, ml: dict, industry: dict) -> list:
     cards = [
         {"label": "Rows", "value": f"{shape[0]:,}"},
         {"label": "Columns", "value": str(shape[1])},
-        {"label": "Data Quality", "value": f"{qd.get('composite_score', det.get('quality_score', 0))}%",
+        {"label": "Composite Data Quality", "value": f"{qd.get('composite_score', det.get('quality_score', 0))}/100",
          "sub": qd.get("grade", "")},
     ]
     task_type = ml.get("task_type", "")

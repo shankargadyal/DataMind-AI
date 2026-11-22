@@ -53,8 +53,8 @@ def _caption_for_summary(top_features: list, task_type: str) -> str:
     )
 
     return (
-        f"{names} have the strongest influence on {verb}. "
-        "Features further down the chart matter much less."
+        f"{names} have the largest model contributions on {verb}. "
+        "These are predictive associations."
     )
 
 
@@ -110,6 +110,9 @@ def generate_shap_plots(
     feature_cols: list,
     task_type: str,
     instance_idx: int = 0,
+    class_index=None,
+    class_labels=(),
+    target=None,
 ) -> dict:
     """
     Generate global feature-importance and local-contribution plots.
@@ -125,26 +128,6 @@ def generate_shap_plots(
         Dictionary containing plots, captions and feature contributions,
         or an unavailable status with a reason.
     """
-
-    # Avoid the known SHAP/CatBoost multiclass native crash.
-    try:
-        from agents.ml_engineer import _shap_unsafe
-
-        if _shap_unsafe(model):
-            return {
-                "available": False,
-                "reason": (
-                    "SHAP plots are skipped for CatBoost multiclass "
-                    "models because of a known native crash in the "
-                    "SHAP/CatBoost combination. Feature importance "
-                    "from the model itself should be used instead."
-                ),
-            }
-
-    except ImportError:
-        # Keep explainability usable if the ML-engineer module
-        # cannot be imported. SHAP computation may still fail below.
-        pass
 
     # Validate inputs before loading heavy dependencies.
     if model is None or X_sample is None or len(X_sample) == 0:
@@ -178,23 +161,29 @@ def generate_shap_plots(
         }
 
     try:
-        sample = X_sample[: min(150, len(X_sample))]
-
-        explainer = shap.Explainer(model, sample)
-        shap_values = explainer(sample)
-
-        vals = shap_values.values
-
-        # Handle multiclass output by averaging absolute SHAP values.
-        if vals.ndim == 3:
-            vals_for_summary = np.abs(vals).mean(axis=2)
+        sample = X_sample[: min(50, len(X_sample))]
+        if sample.ndim != 2 or sample.shape[1] != len(feature_cols):
+            raise ValueError("Transformed features and feature names have different shapes")
+        if task_type == "classification":
+            idx_class = class_index if class_index is not None else 0
+            explained_class = class_labels[idx_class] if len(class_labels) else str(model.classes_[idx_class])
+            output = lambda rows: model.predict_proba(rows)[:, idx_class]
+            scale = "probability"
         else:
-            vals_for_summary = vals
+            explained_class = None
+            output, scale = model.predict, "target units"
+        scope = f"Target: {target}. Output scale: {scale}."
+        if explained_class is not None:
+            scope += f" Explained class: {explained_class}."
+        explainer = shap.Explainer(output, sample[:32], algorithm="permutation",
+                                   feature_names=feature_cols, seed=42)
+        shap_values = explainer(sample, max_evals=2 * len(feature_cols) + 1, silent=True)
+        vals = shap_values.values
 
         # ---------------------------------------------------------
         # Global summary plot
         # ---------------------------------------------------------
-        mean_abs = np.abs(vals_for_summary).mean(axis=0)
+        mean_abs = np.abs(vals).mean(axis=0)
         order = np.argsort(mean_abs)[::-1]
 
         top_n = min(12, len(feature_cols))
@@ -242,24 +231,12 @@ def generate_shap_plots(
         # ---------------------------------------------------------
         # Local contribution plot for one instance
         # ---------------------------------------------------------
-        idx = min(max(instance_idx, 0), len(sample) - 1)
-
-        if vals.ndim == 3:
-            # Use the first class for the local multiclass illustration.
-            inst_vals = vals[idx, :, 0]
-
-            base_value = float(
-                np.atleast_1d(shap_values.base_values[idx])[0]
-            )
-        else:
-            inst_vals = vals[idx]
-
-            if hasattr(shap_values, "base_values"):
-                base_value = float(
-                    np.atleast_1d(shap_values.base_values[idx])[0]
-                )
-            else:
-                base_value = 0.0
+        idx = max(0, min(instance_idx, len(sample) - 1))
+        inst_vals = vals[idx]
+        base_value = float(shap_values.base_values[idx])
+        expected_output = float(output(sample[idx:idx + 1])[0])
+        if not np.isclose(base_value + inst_vals.sum(), expected_output, rtol=1e-5, atol=1e-6):
+            raise ValueError("SHAP contributions do not reconstruct the model output")
 
         order2 = np.argsort(np.abs(inst_vals))[::-1][:10]
 
@@ -319,17 +296,21 @@ def generate_shap_plots(
         return {
             "available": True,
             "summary_plot": summary_b64,
-            "summary_caption": _caption_for_summary(
+            "summary_caption": "Global explanation. " + scope + " " + _caption_for_summary(
                 top_features,
                 task_type,
             ),
             "top_features": top_features,
             "waterfall_plot": waterfall_b64,
-            "waterfall_caption": _caption_for_waterfall(
+            "waterfall_caption": "Local explanation. " + scope + " " + _caption_for_waterfall(
                 contribs,
                 base_value,
                 final_value,
             ),
+            "target": target,
+            "explained_class": explained_class,
+            "output_scale": scale,
+            "model_output": expected_output,
             "waterfall_instance": int(idx),
             "waterfall_base_value": round(base_value, 4),
             "waterfall_final_value": round(final_value, 4),

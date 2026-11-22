@@ -16,6 +16,7 @@ constraints on Render/Railway free tiers).
 """
 
 from __future__ import annotations
+import json
 import re
 from sklearn.feature_extraction.text import TfidfVectorizer, ENGLISH_STOP_WORDS
 from sklearn.metrics.pairwise import cosine_similarity
@@ -118,8 +119,9 @@ def build_chunks(analysis_data: dict, ml_result: dict = None, det_result: dict =
 class JobRAGIndex:
     """One of these is built per completed job and cached in the job dict."""
 
-    def __init__(self, chunks: list[dict]):
+    def __init__(self, chunks: list[dict], evidence=None):
         self.chunks = chunks
+        self.evidence = evidence or {}
         self.vectorizer = None
         self.matrix = None
         if not chunks:
@@ -144,7 +146,23 @@ class JobRAGIndex:
         ]
 
 
-def run_rag_indexing(analysis_data: dict, ml_result: dict = None, det_result: dict = None) -> JobRAGIndex:
+def run_rag_indexing(analysis_data: dict, ml_result: dict = None, det_result: dict = None, evidence=None) -> JobRAGIndex:
     """Entry point called once from run_pipeline() after Reporter finishes."""
     chunks = build_chunks(analysis_data, ml_result, det_result)
-    return JobRAGIndex(chunks)
+    if evidence:
+        for key in ("dataset", "target", "quality"):
+            chunks.append({"source": key, "text": f"{key}: " + json.dumps(evidence[key], ensure_ascii=False)})
+        if evidence["target"]["distribution"]:
+            chunks.append({"source": "target/distribution", "text": "Active target class counts: " +
+                           json.dumps(evidence["target"]["distribution"], ensure_ascii=False)})
+        if evidence["model"]["availability"]:
+            chunks.append({"source": "models/availability", "text": "Feature timing: " +
+                           json.dumps(evidence["model"]["availability"], ensure_ascii=False)})
+        for model in evidence["model"]["models"]:
+            chunks.append({"source": f"models/{model['name']}",
+                           "text": model["name"] + " hold-out and validation metrics: " + json.dumps(model["metrics"], ensure_ascii=False)})
+        shap = evidence["model"].get("shap", {})
+        for key in ("summary_caption", "waterfall_caption"):
+            if shap.get(key):
+                chunks.append({"source": f"models/shap/{key}", "text": shap[key]})
+    return JobRAGIndex(chunks, evidence)

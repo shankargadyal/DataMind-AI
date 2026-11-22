@@ -294,8 +294,6 @@ def run_detective(filepath: str) -> dict:
     }
 
     # ── Quality score ────────────────────────────────────────────
-    completeness = 1 - (missing_before / max(original_shape[0] * original_shape[1], 1))
-    quality_score = round(completeness * 100, 1)
 
     # ── Column stats (with outliers for numeric) ─────────────────
     column_stats = {}
@@ -409,7 +407,7 @@ def run_detective(filepath: str) -> dict:
         "missing_values_fixed": missing_values_fixed,
         "missing_before": missing_before,
         "missing_after": missing_after,
-        "quality_score": quality_score,
+        "quality_score": quality_dimensions["composite_score"],
         "quality_dimensions": quality_dimensions,
         "is_timeseries": is_timeseries,
         "size_hint": size_hint,

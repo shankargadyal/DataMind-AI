@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
+import { loadPredictionModel, waitForRetry } from "./analysisSession";
 import {
   BarChart, Bar, LineChart, Line, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
@@ -25,11 +26,8 @@ const datasetDownloadName = (filename, suffix, extension) => {
 };
 
 // ─── CONFIG ──────────────────────────────────────────────────────
-// Use the same machine hostname as the frontend, but talk to Flask on port 5000.
-const API_BASE =
-  window.location.hostname === "localhost"
-    ? "http://localhost:5000"
-    : window.location.origin;
+const API_BASE = import.meta.env.VITE_API_BASE ||
+  (import.meta.env.DEV ? `http://${window.location.hostname}:5000` : "");
 const CHART_COLORS = ["#D98E2B","#2BA8AF","#4FB88A","#E0566F","#9B6FD9","#4FA8C9","#D9772E","#7AA85C"];
 
 // ─── CSS VARIABLES & GLOBAL STYLES ───────────────────────────────
@@ -598,6 +596,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
     poll.current = setInterval(async () => {
       try {
         const r = await apiFetch(`/api/status/${id}`, {}, token);
+        if (r.status >= 500 || r.status === 429) return;
         const d = await r.json();
         setStep(d.step || 0); setStepName(d.step_name || ""); setLogs(d.logs || []);
         setStepHistory(d.step_history || []);
@@ -624,7 +623,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
       const r = await apiFetch(`/api/jobs/${held.id}/review`, { method: "POST", body: JSON.stringify({ decision }) }, token);
       const d = await r.json();
       if (!r.ok) { setErr(d.error || "Review failed"); return; }
-      if (decision === "approve") { setJobSt("done"); onJobDone(held.result, held.id, held.history); setHeld(null); }
+      if (decision === "approve") { setJobSt("done"); onJobDone({ ...held.result, review: d.review }, held.id, held.history); setHeld(null); }
       else { setJobSt("rejected"); setHeld(null); setErr("Analysis rejected. Upload a corrected dataset to run it again."); }
     } catch { setErr("Connection lost"); }
   }
@@ -772,6 +771,7 @@ function UploadPage({ token, onJobDone, setJobMeta }) {
             {jobSt === "running" && <Spinner size={13} />}
             {jobSt === "done"    && <Badge type="green">Complete</Badge>}
             {jobSt === "error"   && <Badge type="red">Failed</Badge>}
+            {jobSt === "needs_review" && <Badge type="amber">Pending review</Badge>}
           </div>
           <AgentPipeline step={step} jobStatus={jobSt} stepHistory={stepHistory} />
           {stepName && (
@@ -812,7 +812,7 @@ function InsightsPage({ jobResult, setPage }) {
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
         <KpiCard label="Total Rows"     value={(stats.total_rows || 0).toLocaleString()} />
         <KpiCard label="Columns"        value={stats.total_cols || 0} />
-        <KpiCard label="Data Quality"   value={`${stats.composite_quality_score ?? stats.quality_score ?? 0}%`} sub="Composite quality score" />
+        <KpiCard label="Composite Data Quality" value={`${stats.composite_quality_score ?? stats.quality_score ?? "—"}/100`} />
         <KpiCard label="Insights Found" value={stats.insights_count || insights.length} />
       </div>
 
@@ -1108,6 +1108,23 @@ function MLResultsPage({ jobResult, setPage }) {
         </div>
       )}
 
+      {jobResult.eval?.baseline_comparison?.message && (
+        <div className="card" style={{ padding: 16 }}>{jobResult.eval.baseline_comparison.message}</div>
+      )}
+      {Object.keys(ml.feature_availability || {}).length > 0 && (
+        <div className="card" style={{ padding: 16 }}>
+          <strong>Prediction-time feature availability</strong>
+          {Object.entries(ml.feature_availability).map(([name, entry]) => <p key={name}><b>{name}</b> · {entry.reason}</p>)}
+          {ml.availability_comparison?.best_model && (
+            <p>All eligible features · {ml.best_model} · {formatScore(ml.best_score, ml.task_type)}.
+              {" "}Excluding {ml.availability_comparison.excluded.join(", ")} · {ml.availability_comparison.best_model}
+              {" "}· {formatScore(ml.availability_comparison.best_metrics[ml.task_type === "classification" ? "accuracy" : "r2"], ml.task_type)}.
+              {ml.task_type === "classification" && bm.macro_f1 != null && ` Macro F1: ${(bm.macro_f1 * 100).toFixed(1)}% with all eligible features, ${(ml.availability_comparison.best_metrics.macro_f1 * 100).toFixed(1)}% with restricted features.`}
+            </p>
+          )}
+        </div>
+      )}
+
       {/* Models table */}
       {mods.length > 0 && (
         <div className="card" style={{ padding: 16 }}>
@@ -1187,7 +1204,7 @@ function MLResultsPage({ jobResult, setPage }) {
 }
 
 // ─── PREDICT PAGE ─────────────────────────────────────────────────
-function PredictPage({ token, jobId, setPage }) {
+function PredictPage({ token, jobId, jobStatus, active, setPage }) {
   const [feats, setFeats] = useState([]);
   const [inputs, setInputs] = useState({});
   const [taskType, setTask] = useState("");
@@ -1205,22 +1222,32 @@ function PredictPage({ token, jobId, setPage }) {
   const [whatIfBusy, setWhatIfBusy] = useState(false);
 
   useEffect(() => {
-    setModelStatus("loading"); setReady(false); setFeats([]); setInputs({}); setResult(null); setHistory([]); setScenario(null); setWhatIfResult(null); setErr("");
-    if (!jobId) return;
-    let cancelled = false;
-    apiFetch(`/api/predict_info/${jobId}`, {}, token)
-      .then(async r => { const d = await r.json(); if (!r.ok) throw new Error(d.error || "Could not load model information"); return d; })
-      .then(d => {
-        if (cancelled) return;
-        if (!Array.isArray(d.features) || !d.features.length) throw new Error("No prediction features available");
-        setFeats(d.features); setTask(d.task_type || ""); setTarget(d.target || "");
-        const defaults = {};
-        d.features.forEach(f => { defaults[f.name] = f.input_type === "categorical" ? (f.default ?? f.options?.[0] ?? "") : Number.isFinite(Number(f.default ?? f.mean)) && (f.default ?? f.mean) != null ? String(Number(Number(f.default ?? f.mean).toFixed(3))) : ""; });
-        setInputs(defaults); setReady(true); setModelStatus("ready");
-      })
-      .catch(e => { if (!cancelled) { setModelStatus("error"); setErr(e.message || "Could not load prediction inputs"); } });
-    return () => { cancelled = true; };
-  }, [jobId, token, retryCount]);
+    if (!jobId || !active || ready) return;
+    const controller = new AbortController();
+    const { signal } = controller;
+    setModelStatus("loading"); setErr("");
+    loadPredictionModel(
+      requestSignal => apiFetch(`/api/predict_info/${jobId}`, { signal: requestSignal }, token),
+      { signal, wait: waitForRetry },
+    ).then(data => {
+      if (signal.aborted || !data) return;
+      if (data.status !== "ready" || !Array.isArray(data.features) || !data.features.length) {
+        setModelStatus(data.status === "ready" ? "artifact_unavailable" : data.status);
+        setErr(data.message || "No prediction features available.");
+        return;
+      }
+      setFeats(data.features); setTask(data.task_type || ""); setTarget(data.target || "");
+      const defaults = {};
+      data.features.forEach(f => {
+        defaults[f.name] = f.input_type === "categorical" ? (f.default ?? f.options?.[0] ?? "") :
+          f.default != null ? String(f.default) : f.mean != null ? String(f.mean) : "";
+      });
+      setInputs(defaults); setReady(true); setModelStatus("ready");
+    }).catch(() => {
+      if (!signal.aborted) { setModelStatus("unavailable"); setErr("The prediction service could not be reached."); }
+    });
+    return () => controller.abort();
+  }, [jobId, jobStatus, active, token, retryCount, ready]);
 
   const invalid = feats.filter(f => {
     const raw = String(inputs[f.name] ?? "").trim();
@@ -1289,7 +1316,9 @@ function PredictPage({ token, jobId, setPage }) {
           {ready && <button className="btn-ghost" onClick={() => { const defaults = {}; feats.forEach(f => { defaults[f.name] = f.default != null ? String(f.default) : (f.input_type === "categorical" ? (f.options?.[0] ?? "") : ""); }); setInputs(defaults); setResult(null); setErr(""); }}>↺ Reset values</button>}
         </div>
         {!ready && !err && <div style={{ display: "flex", alignItems: "center", gap: 9, padding: "18px 0", color: "var(--text2)" }}><Spinner /> Loading model metadata…</div>}
-        {!ready && err && <div role="alert" style={{padding:16,background:"var(--danger-bg)",borderRadius:10,color:"var(--danger)",display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><span>{err}. If the analysis is held for review, approve it in Upload first.</span><button className="btn-ghost" onClick={() => setRetryCount(v => v + 1)}>Retry model loading</button></div>}
+        {!ready && err && <div role="alert" style={{padding:16,background:"var(--danger-bg)",borderRadius:10,color:"var(--danger)",display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,flexWrap:"wrap"}}><span>{err}</span>
+          {modelStatus === "pending_review" && <button className="btn-ghost" onClick={() => setPage("upload")}>Open review</button>}
+          {["training", "unavailable"].includes(modelStatus) && <button className="btn-ghost" onClick={() => setRetryCount(v => v + 1)}>Retry model loading</button>}</div>}
         {ready && <>
           <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(min(100%,280px),1fr))", gap: 16 }}>
             {displayed.map(f => {
@@ -1298,6 +1327,7 @@ function PredictPage({ token, jobId, setPage }) {
               return <label key={f.name} style={{ display: "block" }}>
                 <span style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 7, fontSize: 12, fontWeight: 600 }}><span>{pretty(f.name)}</span><span className="mono" style={{ fontSize: 10, fontWeight: 400, color: "var(--text3)" }}>{f.input_type === "categorical" ? "Category" : Number.isFinite(f.min) && Number.isFinite(f.max) ? `${f.min.toFixed(1)} – ${f.max.toFixed(1)}` : "Numeric"}</span></span>
                 {f.input_type === "categorical" ? <select className="input" value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad}>{(f.options || []).map(option => <option key={option} value={option}>{option}</option>)}</select> : <input className="input" type="number" step="any"  value={inputs[f.name] ?? ""} onChange={e => { setInputs(p => ({ ...p, [f.name]: e.target.value })); setErr(""); }} style={{ padding: "12px 13px", borderColor: bad ? "var(--danger)" : undefined }} aria-invalid={bad} />}
+                {f.availability && <small style={{ color: "var(--text3)" }}>{f.availability}</small>}
               </label>;
             })}
           </div>
@@ -1474,7 +1504,7 @@ function ReportPage({ token, jobId, jobResult, setPage }) {
           {[
             ["Dataset",  jobResult.filename || "—"],
             ["Rows",     (stats.total_rows || 0).toLocaleString()],
-            ["Quality",  `${stats.quality_score || 0}%`],
+            ["Composite Quality", `${stats.composite_quality_score ?? stats.quality_score ?? "—"}/100`],
             ["Model",    ml.best_model || "—"],
             ["Score",    formatScore(ml.best_score, ml.task_type)],
             ["Task",     ml.task_type || "—"],
@@ -1646,7 +1676,7 @@ function DashboardPage({ jobResult, jobStep, jobStatus, jobStepHistory, setPage 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 12 }}>
         <KpiCard label="Rows Analysed" value={(stats.total_rows || 0).toLocaleString()} />
         <KpiCard label="Columns"       value={stats.total_cols || 0} />
-        <KpiCard label="Data Quality"  value={`${stats.composite_quality_score ?? stats.quality_score ?? 0}%`} sub="Composite quality score" />
+        <KpiCard label="Composite Data Quality" value={`${stats.composite_quality_score ?? stats.quality_score ?? "—"}/100`} />
         <KpiCard label="Best Model"    value={ml.best_model || "—"} sub={formatScore(ml.best_score, ml.task_type)} highlight />
       </div>
 
@@ -1701,7 +1731,8 @@ function AppShell({ user, token, onLogout }) {
   useEffect(() => { document.documentElement.setAttribute("data-theme", theme); }, [theme]);
 
   function handleJobDone(result, id, stepHist) {
-    setResult(result); setStatus("done"); setJobStepHistory(stepHist || []); setPage("insights");
+    setResult(result); setStatus("done"); setJobStepHistory(stepHist || []);
+    setPage(current => current === "upload" ? "insights" : current);
   }
 
   // NOTE: no longer accepts/stores an apiKey — the chat API key box was
@@ -1721,7 +1752,7 @@ function AppShell({ user, token, onLogout }) {
           {page === "insights"  && <InsightsPage  jobResult={jobResult} setPage={setPage} />}
           {page === "charts"    && <ChartsPage    jobResult={jobResult} setPage={setPage} />}
           {page === "ml"        && <MLResultsPage jobResult={jobResult} setPage={setPage} />}
-          <div style={{display:page === "predict" ? "block" : "none"}}><PredictPage key={jobId || "empty"} token={token} jobId={jobId} setPage={setPage} /></div>
+          <div style={{display:page === "predict" ? "block" : "none"}}><PredictPage key={jobId || "empty"} token={token} jobId={jobId} jobStatus={jobStatus} active={page === "predict"} setPage={setPage} /></div>
           <div style={{display:page === "chat" ? "block" : "none"}}><ChatPage key={jobId || "empty"} token={token} jobId={jobId} /></div>
           {page === "report"    && <ReportPage    token={token} jobId={jobId} jobResult={jobResult} setPage={setPage} />}
           {page === "history"   && <HistoryPage   token={token} setPage={setPage} />}

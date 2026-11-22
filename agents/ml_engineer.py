@@ -1,7 +1,6 @@
 """
 Agent 3: ML Engineer v3.0 — Full ML pipeline.
 New in v3:
-  - Polynomial feature engineering (degree-2 for top features)
   - Cross-validation scores alongside test scores
   - Exploratory mode (returns EDA stats instead of model)
   - Better future prediction with trend-based adjustment
@@ -10,10 +9,16 @@ New in v3:
   - Safe fallback for every sub-step
 """
 import os
+import platform
+from importlib.metadata import PackageNotFoundError, version
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import LabelEncoder, StandardScaler, PolynomialFeatures
+from sklearn.preprocessing import LabelEncoder, StandardScaler, OrdinalEncoder
 from sklearn.impute import SimpleImputer
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import KFold, StratifiedKFold
+import sklearn
 from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.ensemble import (
     RandomForestClassifier, RandomForestRegressor,
@@ -66,7 +71,7 @@ def _detect_task(series: pd.Series) -> str:
     if not pd.api.types.is_numeric_dtype(series):
         return "classification"
     n_unique = series.nunique()
-    n_total = len(series)
+    n_total = max(len(series), 1)
     if n_unique <= 10 or (n_unique / n_total < 0.05 and n_unique <= 20):
         return "classification"
     return "regression"
@@ -93,55 +98,43 @@ def _select_target(df: pd.DataFrame, det: dict, requested: str) -> str | None:
 
 # ── Feature engineering ─────────────────────────────────────────────────────
 
-def _engineer_features(df: pd.DataFrame, det: dict) -> tuple:
-    """Create a predictable, one-row-safe tabular feature schema.
-
-    Date-derived and rolling/lag features are deliberately excluded from
-    interactive prediction: a single row has no historical context. Forecasting
-    uses its own dedicated agent and is unaffected by this change.
-    """
-    out = df.copy()
-    date_cols = set(det.get("date_cols", []) or [])
-    categorical_mappings = {}
-    engineered = {}
-    for col in out.columns:
-        if col in date_cols or pd.api.types.is_datetime64_any_dtype(out[col]):
+def _engineer_features(frame, date_cols, chronological):
+    """Create row-local date parts and strictly past-only exogenous features."""
+    features = frame.copy()
+    engineered = []
+    for col in date_cols:
+        if col not in features:
             continue
-        if pd.api.types.is_numeric_dtype(out[col]):
-            out[col] = pd.to_numeric(out[col], errors="coerce").replace([np.inf, -np.inf], np.nan)
-        else:
-            values = out[col].astype("string").fillna("(missing)").astype(str)
-            # Never allow a categorical feature to become a raw ordinal label
-            # without retaining its vocabulary for inference.
-            encoder = LabelEncoder()
-            out[col] = encoder.fit_transform(values)
-            categorical_mappings[col] = [str(v) for v in encoder.classes_]
-    feature_cols = [c for c in out.columns if c not in date_cols
-                    and pd.api.types.is_numeric_dtype(out[c])]
-    return out, feature_cols, engineered, categorical_mappings
+        values = pd.to_datetime(features.pop(col), errors="coerce", format="mixed")
+        for suffix, part in (("year", values.dt.year), ("month", values.dt.month),
+                             ("day", values.dt.day), ("dow", values.dt.dayofweek)):
+            name = f"{col}_{suffix}"
+            if name not in features:
+                features[name] = part
+        engineered.append(f"date_{col}")
+
+    if chronological:
+        for col in frame.select_dtypes(include="number").columns[:3]:
+            past = frame[col].shift(1)
+            for suffix, values in (("roll3", past.rolling(3, min_periods=1).mean()),
+                                   ("lag1", past), ("lag3", frame[col].shift(3))):
+                name = f"{col}_{suffix}"
+                if name not in features:
+                    features[name] = values
+            engineered.append(f"rolling_{col}")
+    return features, engineered
 
 
-def _add_polynomial_features(X_train, X_test, feature_cols, top_n=5):
-    """Add degree-2 polynomial interactions for the top N features."""
-    try:
-        if len(feature_cols) < 2:
-            return X_train, X_test, feature_cols
-        top = min(top_n, len(feature_cols))
-        poly = PolynomialFeatures(degree=2, include_bias=False, interaction_only=True)
-        # Only on top features to avoid explosion
-        X_tr_top = X_train[:, :top]
-        X_te_top = X_test[:, :top]
-        X_tr_poly = poly.fit_transform(X_tr_top)
-        X_te_poly = poly.transform(X_te_top)
-        X_train_out = np.hstack([X_train, X_tr_poly[:, top:]])
-        X_test_out  = np.hstack([X_test,  X_te_poly[:, top:]])
-        poly_names = [f"poly_{i}" for i in range(X_tr_poly.shape[1] - top)]
-        return X_train_out, X_test_out, feature_cols + poly_names
-    except Exception:
-        return X_train, X_test, feature_cols
-
-
-# ── Model catalogue ─────────────────────────────────────────────────────────
+def _preprocessor(X):
+    numeric = X.select_dtypes(include="number").columns.tolist()
+    categorical = [col for col in X if col not in numeric]
+    return ColumnTransformer([
+        ("numeric", SimpleImputer(strategy="median", keep_empty_features=True), numeric),
+        ("categorical", Pipeline([
+            ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),
+            ("encode", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),
+        ]), categorical),
+    ], verbose_feature_names_out=False)
 
 
 def _get_models(task_type: str):
@@ -220,19 +213,19 @@ def _safe_cv(model, X_train, y_train, scoring: str, task_type: str, is_timeserie
         folds = int(min(3, counts.min())) if len(counts) else 0
         if folds < 2:
             return None, None, 0, "cross-validation skipped: smallest class in the training split has < 2 members"
-        cv = folds
+        cv = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
     else:
-        folds = 3 if len(y_train) >= 30 else 0
+        folds = 3 if len(y_train) >= 12 else 0
         if folds < 2:
             return None, None, 0, "cross-validation skipped: too few training rows"
         if is_timeseries:
             from sklearn.model_selection import TimeSeriesSplit
             cv = TimeSeriesSplit(n_splits=folds)
         else:
-            cv = folds
+            cv = KFold(n_splits=folds, shuffle=True, random_state=42)
     try:
-        scores = cross_val_score(clone(model), X_train, y_train, cv=cv, scoring=scoring)
-        return round(float(scores.mean()), 4), round(float(scores.std()), 4), folds, ""
+        scores = cross_val_score(clone(model), X_train, y_train, cv=cv, scoring=scoring, error_score='raise')
+        return float(scores.mean()), float(scores.std()), folds, ""
     except Exception as e:
         return None, None, 0, f"cross-validation failed: {type(e).__name__}"
 
@@ -247,74 +240,64 @@ def _safe_cv_classification(model, X_train, y_train):
     if folds < 2:
         return None, None, None, 0, "cross-validation skipped: smallest class in the training split has < 2 members"
     try:
-        cv = cross_validate(clone(model), X_train, y_train, cv=folds, scoring={"acc": "accuracy", "f1m": "f1_macro"})
-        return (round(float(cv["test_acc"].mean()), 4), round(float(cv["test_acc"].std()), 4),
-                round(float(cv["test_f1m"].mean()), 4), folds, "")
+        splitter = StratifiedKFold(n_splits=folds, shuffle=True, random_state=42)
+        cv = cross_validate(clone(model), X_train, y_train, cv=splitter, error_score="raise",
+                            scoring={"acc": "accuracy", "f1m": "f1_macro"})
+        return (float(cv["test_acc"].mean()), float(cv["test_acc"].std()),
+                float(cv["test_f1m"].mean()), folds, "")
     except Exception as e:
         return None, None, None, 0, f"cross-validation failed: {type(e).__name__}"
 
 
-def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type: str, n_classes: int = 0, is_timeseries: bool = False) -> dict:
-    y_pred = model.predict(X_test)
-    if task_type == "classification":
-        avg = "weighted"
-        labels = list(range(n_classes)) if n_classes else None
-        cm = confusion_matrix(y_test, y_pred, labels=labels).tolist()
-        cv_mean, cv_std, cv_f1_macro, folds, cv_note = _safe_cv_classification(model, X_train, y_train)
-        return {
-            "accuracy":          round(float(accuracy_score(y_test, y_pred)), 4),
-            "precision":         round(float(precision_score(y_test, y_pred, average=avg, zero_division=0)), 4),
-            "recall":            round(float(recall_score(y_test, y_pred, average=avg, zero_division=0)), 4),
-            "f1":                round(float(f1_score(y_test, y_pred, average=avg, zero_division=0)), 4),
-            "f1_macro":          round(float(f1_score(y_test, y_pred, average="macro", zero_division=0)), 4),
-            "confusion_matrix":  cm,
-            "cv_score":          cv_mean,
-            "cv_std":            cv_std,
-            "cv_f1_macro":       cv_f1_macro,
-            "cv_folds":          folds,
-            "cv_note":           cv_note,
-            "n_test":            int(len(y_test)),
-            # precision/recall/f1 above are weighted by class size; f1_macro counts every class equally
-            "averaging":         "precision/recall/f1 = weighted by class size; f1_macro = unweighted mean over classes",
-        }
-    rmse = float(np.sqrt(mean_squared_error(y_test, y_pred)))
-    cv_mean, cv_std, folds, cv_note = _safe_cv(model, X_train, y_train, "r2", task_type, is_timeseries)
-    return {
-        "r2":       round(float(r2_score(y_test, y_pred)), 4),
-        "mae":      round(float(mean_absolute_error(y_test, y_pred)), 4),
-        "rmse":     round(rmse, 4),
-        "cv_score": cv_mean,
-        "cv_std":   cv_std,
-        "cv_folds": folds,
-        "cv_note":  cv_note,
-        "n_test":   int(len(y_test)),
+def classification_metrics(y_test, y_pred, labels, positive_index=None, baseline_class=None):
+    classes = list(range(len(labels)))
+    matrix = confusion_matrix(y_test, y_pred, labels=classes)
+    support = matrix.sum(axis=1)
+    metrics = {
+        "accuracy": float(accuracy_score(y_test, y_pred)),
+        "precision": float(precision_score(y_test, y_pred, average="weighted", zero_division=0)),
+        "recall": float(recall_score(y_test, y_pred, average="weighted", zero_division=0)),
+        "macro_f1": float(f1_score(y_test, y_pred, labels=classes, average="macro", zero_division=0)),
+        "weighted_f1": float(f1_score(y_test, y_pred, average="weighted", zero_division=0)),
+        "confusion_matrix": matrix.tolist(),
+        "confusion_labels": list(labels),
+        "holdout_support": {label: int(n) for label, n in zip(labels, support)},
+        "majority_baseline_accuracy": float(support.max() / support.sum()),
     }
+    majority = int(support.argmax())
+    baseline = np.full(len(y_test), majority)
+    metrics["baseline_macro_f1"] = float(f1_score(y_test, baseline, labels=classes, average="macro", zero_division=0))
+    metrics["majority_baseline_label"] = labels[majority]
+    if baseline_class is not None:
+        metrics["train_majority_holdout_accuracy"] = float(support[baseline_class] / support.sum())
+    metrics["f1"] = metrics["weighted_f1"]
+    if positive_index is not None:
+        negative_index = 1 - positive_index
+        tp, fp = (int(matrix[i, positive_index]) for i in (positive_index, negative_index))
+        fn, tn = (int(matrix[i, negative_index]) for i in (positive_index, negative_index))
+        metrics.update({
+            "positive_class": labels[positive_index],
+            "positive_recall": tp / (tp + fn) if tp + fn else None,
+            "positive_precision": tp / (tp + fp) if tp + fp else None,
+            "positive_f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else None,
+            "binary_confusion": {"tp": tp, "fp": fp, "fn": fn, "tn": tn},
+        })
+    return metrics
 
 
-def _plan_split(y, task_type: str, test_size: float) -> dict:
-    """Decide whether a stratified split is valid BEFORE calling train_test_split."""
-    plan = {"stratify": False, "warnings": [], "class_counts": {}}
-    if task_type != "classification":
-        return plan
-    classes, counts = np.unique(y, return_counts=True)
-    plan["class_counts"] = {int(c): int(n) for c, n in zip(classes, counts)}
-    n_test = int(np.ceil(len(y) * test_size))
-    if counts.min() >= 2 and n_test >= len(classes) and (len(y) - n_test) >= len(classes):
-        plan["stratify"] = True
-    else:
-        rare = [int(c) for c, n in zip(classes, counts) if n < 2]
-        if rare:
-            plan["warnings"].append(
-                f"{len(rare)} target class(es) have only 1 member; a stratified split is impossible, "
-                "so a plain random split was used. Rare classes were kept (not removed); "
-                "metrics for them are not reliable."
-            )
-        elif n_test < len(classes):
-            plan["warnings"].append("Test split is smaller than the number of classes; a plain random split was used.")
-    few = [int(c) for c, n in zip(classes, counts) if 2 <= n < 5]
-    if few:
-        plan["warnings"].append(f"{len(few)} class(es) have fewer than 5 members — per-class metrics are unreliable.")
-    return plan
+def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type, labels, positive_index, chronological):
+    predicted = model.predict(X_test)
+    if task_type == "classification":
+        acc, std, macro, folds, note = _safe_cv_classification(model, X_train, y_train)
+        metrics = classification_metrics(y_test, predicted, labels, positive_index, int(np.bincount(y_train).argmax()))
+        metrics.update(cv_score=acc, cv_std=std, cv_f1_macro=macro, cv_folds=folds, cv_note=note,
+                       n_test=len(y_test), f1_macro=metrics["macro_f1"],
+                       averaging="Precision, recall and weighted F1 use class support. Macro F1 weights classes equally.")
+        return metrics
+    mean, std, folds, note = _safe_cv(model, X_train, y_train, "r2", task_type, chronological)
+    return {"r2": float(r2_score(y_test, predicted)), "mae": float(mean_absolute_error(y_test, predicted)),
+            "rmse": float(np.sqrt(mean_squared_error(y_test, predicted))),
+            "cv_score": mean, "cv_std": std, "cv_folds": folds, "cv_note": note, "n_test": len(y_test)}
 
 
 # ── SHAP / feature importance ───────────────────────────────────────────────
@@ -431,7 +414,7 @@ def _get_feature_importance(
 
 # ── Future prediction ───────────────────────────────────────────────────────
 
-def _future_prediction(model, scaler, feature_cols, df_feat, target_col, steps=10):
+def _future_prediction(pipeline, feature_cols, df_feat, target_col, steps=10):
     try:
         historical_y = df_feat[target_col].values.tolist()
         recent = historical_y[-min(10, len(historical_y)):]
@@ -454,22 +437,10 @@ def _future_prediction(model, scaler, feature_cols, df_feat, target_col, steps=1
         else:
             trend_r2, std_error = None, None
 
-        lag1 = f"{target_col}_lag1"
-        lag3 = f"{target_col}_lag3"
-        roll3 = f"{target_col}_roll3"
-        base_row = df_feat[feature_cols].iloc[-1].copy()
-        history = historical_y[:]
+        base_row = df_feat[feature_cols].iloc[[-1]]
         future_y, conf_upper, conf_lower = [], [], []
         for i in range(steps):
-            row = base_row.copy()
-            if lag1 in row.index:
-                row[lag1] = history[-1]
-            if lag3 in row.index and len(history) >= 3:
-                row[lag3] = history[-3]
-            if roll3 in row.index:
-                row[roll3] = float(np.mean(history[-3:]))
-            row_scaled = scaler.transform([row.values])
-            pred = float(model.predict(row_scaled)[0])
+            pred = float(pipeline.predict(base_row)[0])
             trend_adjusted = pred + trend_per_step * min(i, 3) * 0.25
             future_y.append(round(trend_adjusted, 4))
             # Band widens with the forecast horizon (uncertainty compounds further out) instead of being a
@@ -480,7 +451,6 @@ def _future_prediction(model, scaler, feature_cols, df_feat, target_col, steps=1
             band = max(abs(trend_adjusted) * 0.02, se * 1.0) * horizon_factor
             conf_upper.append(round(trend_adjusted + band, 4))
             conf_lower.append(round(trend_adjusted - band, 4))
-            history.append(trend_adjusted)
 
         return {
             "available": True,
@@ -551,253 +521,205 @@ def _exploratory_output(df: pd.DataFrame, det: dict) -> dict:
 
 # ── Main entry ─────────────────────────────────────────────────────────────
 
-def run_ml_engineer(df: pd.DataFrame, det: dict, ana: dict, mode_override: str = "") -> dict:
-    mode_override = (mode_override or "").strip().lower()
-
-    # Explicit routing to clustering or forecasting, requested by the user or
-    # auto-selected by the analyze pipeline (see app.py "mode" form field).
-    if mode_override == "clustering":
+def run_ml_engineer(df, det, ana, mode_override="", selected_target="", availability=None):
+    mode = (mode_override or "").strip().lower()
+    if mode == "clustering":
         return _clustering_agent.run_clustering(df, det)
 
-    if mode_override == "forecasting":
-        ml_rec = ana.get("ml_recommendation", {})
-        target_col = _select_target(df, det, ml_rec.get("target_column", ""))
-        date_cols = det.get("date_cols", [])
-        return _forecasting_agent.run_forecasting(
-            df, det, target_col=target_col or "", date_col=(date_cols[0] if date_cols else "")
-        )
-
-    # Exploratory mode — skip training unless clustering was explicitly requested above
-    if det.get("exploratory_mode") or ana.get("ml_recommendation", {}).get("task_type") == "exploratory":
+    recommendation = ana.get("ml_recommendation", {})
+    if not selected_target and not mode and (det.get("exploratory_mode") or recommendation.get("task_type") == "exploratory"):
         return _exploratory_output(df, det)
+    target = selected_target or _select_target(df, det, recommendation.get("target_column", ""))
+    if target not in df:
+        return {"error": "No valid target column", "models": [], "target_column": selected_target}
+    dates = det.get("date_cols", [])
+    if mode == "forecasting":
+        return _forecasting_agent.run_forecasting(df, det, target_col=target, date_col=dates[0] if dates else "")
 
-    ml_rec      = ana.get("ml_recommendation", {})
-    target_col  = _select_target(df, det, ml_rec.get("target_column", ""))
-    if not target_col or target_col not in df.columns:
-        return {"error": "No valid target column", "models": []}
-
-    # Feature engineering
-    df_feat, feature_cols, engineered, categorical_mappings = _engineer_features(df, det)
-    if target_col in feature_cols:
-        feature_cols.remove(target_col)
-    if not feature_cols:
-        return {"error": "No features available after engineering", "models": []}
-
-    # Drop columns that cannot carry generalisable signal: identifiers & constants.
-    # (Label-encoded IDs/names behave like noise or leak row identity.)
-    skip = set(det.get("identifier_columns", []) or []) | set(det.get("constant_columns", []) or [])
-    dropped_features = [c for c in feature_cols if c in skip and c != target_col]
-    feature_cols = [c for c in feature_cols if c not in skip]
-    if not feature_cols:
-        return {"error": "No usable features after removing identifier/constant columns", "models": []}
-
-    # Rows whose target was missing in the ORIGINAL file must not be trained on with an imputed label.
-    df_raw = det.get("df_raw")
-    target_missing_dropped = 0
-    row_ok = np.ones(len(df_feat), dtype=bool)
-    if isinstance(df_raw, pd.DataFrame) and target_col in df_raw.columns and len(df_raw) == len(df_feat):
-        row_ok = df_raw[target_col].notna().values
-        target_missing_dropped = int((~row_ok).sum())
-    X = df_feat.loc[row_ok, feature_cols].to_numpy(dtype=float)
-    # Use ORIGINAL target values; otherwise label encoding can scramble names.
-    y_raw = df.loc[row_ok, target_col].values
-
-    detected_task = _detect_task(pd.Series(y_raw))
-    analyst_task = (ml_rec.get("task_type") or "").strip().lower()
-    if analyst_task == "exploratory":
-        task_type = "exploratory"
-    elif detected_task == "classification":
-        task_type = "classification"
-    elif analyst_task in ("classification", "regression"):
-        task_type = analyst_task
-    else:
-        task_type = detected_task
-
-    le_target = None
-    if task_type == "classification":
-        le_target = LabelEncoder()
-        y = le_target.fit_transform(pd.Series(y_raw).astype(str).values)
-    else:
-        y = pd.to_numeric(pd.Series(y_raw), errors="coerce").to_numpy(dtype=float)
-
-    mask = np.isfinite(y) if task_type == "regression" else np.ones(len(y), dtype=bool)
-    target_missing_dropped += int((~mask).sum())
-    X, y = X[mask], y[mask]
-    if len(X) < 20:
-        return {"error": "Not enough data rows (need ≥ 20)", "models": []}
-
+    raw = det.get("df_raw")
+    if raw is None:
+        raw = df
+    detected = _detect_task(raw[target].dropna())
+    task = mode if mode in ("classification", "regression") else (
+        "classification" if detected == "classification" or recommendation.get("task_type") == "classification" else "regression"
+    )
     eval_warnings = []
-    if target_missing_dropped:
-        eval_warnings.append(f"{target_missing_dropped} row(s) with a missing target were excluded from model training (not imputed).")
-    if dropped_features:
-        eval_warnings.append(f"Identifier/constant columns excluded from features: {', '.join(dropped_features[:8])}.")
+    relationships = _data_relationships(df, target)
 
-    n_classes = 0
-    if task_type == "classification":
-        n_classes = int(len(np.unique(y)))
-        if n_classes < 2:
-            return {
-                "error": "Classification evaluation impossible: the target has only one class.",
-                "models": [], "task_type": "classification", "target_column": target_col,
-                "classification_skipped": True, "evaluation_warnings": eval_warnings,
-                "class_imbalance": _class_imbalance(y),
-            }
+    def unavailable(message, models=None):
+        return {"error": message, "models": models or [], "target_column": target, "task_type": task,
+                "evaluation_warnings": eval_warnings, "data_relationships": relationships}
 
-    imbalance = _class_imbalance(y) if task_type == "classification" else {}
+    y_raw = raw[target] if task == "classification" else pd.to_numeric(raw[target], errors="coerce")
+    valid = y_raw.notna()
+    if task == "regression":
+        valid &= np.isfinite(y_raw)
+    if valid.sum() < 20:
+        return unavailable("Not enough labeled data rows (need at least 20)")
+    if (~valid).any():
+        eval_warnings.append(f"{int((~valid).sum())} rows without a usable target were excluded.")
 
-    test_size = 0.2 if len(X) > 100 else 0.15
-    plan = _plan_split(y, task_type, test_size)
-    eval_warnings += plan["warnings"]
-    split_kwargs = {"test_size": test_size, "random_state": 42}
-    if det.get("is_timeseries") and task_type == "regression":
-        split_kwargs["shuffle"] = False
-    elif plan["stratify"]:
-        split_kwargs["stratify"] = y
-    try:
-        X_train_raw, X_test_raw, y_train, y_test = train_test_split(X, y, **split_kwargs)
-    except ValueError as e:
-        split_kwargs.pop("stratify", None)
-        eval_warnings.append(f"Stratified split failed ({e}); a plain random split was used.")
-        X_train_raw, X_test_raw, y_train, y_test = train_test_split(X, y, **split_kwargs)
-
-    # Speed cap: RandomForest / GradientBoosting (and their k-fold CV) scale super-linearly, so on very large
-    # data (100k rows took >4.5 min) model *selection* runs on a sample of the TRAINING split only. The hold-out
-    # test set is untouched, and all rows are still used for profiling, analysis and chat calculations.
-    max_train = max(1000, int(os.environ.get("DATAMIND_MAX_TRAIN_ROWS", "20000")))
-    train_rows_before_cap = int(len(y_train))
-    train_cap_note = None
-    if train_rows_before_cap > max_train:
-        if det.get("is_timeseries") and task_type == "regression":
-            X_train_raw, y_train = X_train_raw[-max_train:], y_train[-max_train:]      # keep the most recent rows
-            how = "the most recent"
+    chronological = bool(det.get("is_timeseries") and task == "regression")
+    frame = raw.drop(columns=[target])
+    if chronological and dates and dates[0] in frame:
+        order = pd.to_datetime(frame[dates[0]], errors="coerce", format="mixed").sort_values(kind="stable").index
+        frame = frame.loc[order]
+    X, engineered = _engineer_features(frame, dates, chronological)
+    X = X.loc[valid]
+    for col in X:
+        if pd.api.types.is_numeric_dtype(X[col]) and not pd.api.types.is_bool_dtype(X[col]):
+            X[col] = X[col].astype(float).replace([np.inf, -np.inf], np.nan)
         else:
-            sub = {"train_size": max_train, "random_state": 42}
-            if split_kwargs.get("stratify") is not None:
-                sub["stratify"] = y_train
+            X[col] = X[col].map(lambda v: str(v) if pd.notna(v) else np.nan).astype(object)
+    y_raw = y_raw.loc[X.index]
+    y = y_raw.astype(str).to_numpy() if task == "classification" else y_raw.to_numpy()
+    counts = pd.Series(y).value_counts() if task == "classification" else pd.Series(dtype=int)
+    fraction = 0.2 if len(X) > 100 else 0.15
+    n_test = int(np.ceil(len(X) * fraction))
+    stratified = (task == "classification" and len(counts) >= 2 and counts.min() >= 2
+                  and min(n_test, len(X) - n_test) >= len(counts))
+    if task == "classification" and not stratified:
+        return unavailable("Class support is insufficient for a representative hold-out")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=fraction, random_state=42, shuffle=not chronological, stratify=y if stratified else None,
+    )
+    before_cap = len(y_train)
+    cap = max(1000, int(os.environ.get("DATAMIND_MAX_TRAIN_ROWS", "20000")))
+    if before_cap > cap:
+        if chronological:
+            X_train, y_train = X_train.iloc[-cap:], y_train[-cap:]
+        else:
             try:
-                X_train_raw, _, y_train, _ = train_test_split(X_train_raw, y_train, **sub)
-                how = "a stratified random" if "stratify" in sub else "a random"
+                X_train, _, y_train, _ = train_test_split(
+                    X_train, y_train, train_size=cap, random_state=42, stratify=y_train if stratified else None
+                )
             except ValueError:
-                sub.pop("stratify", None)
-                X_train_raw, _, y_train, _ = train_test_split(X_train_raw, y_train, **sub)
-                how = "a random"
-        train_cap_note = (f"Large dataset: models were fitted and cross-validated on {how} sample of {max_train:,} of the "
-                          f"{train_rows_before_cap:,} training rows to keep runtime reasonable. The hold-out test set "
-                          f"({len(y_test):,} rows) is untouched; profiling, analysis and chat calculations use all rows.")
-        eval_warnings.append(train_cap_note)
+                return unavailable("The training sample cap cannot represent all target classes")
+        eval_warnings.append(f"Used {cap:,} of {before_cap:,} training rows. The hold-out split was kept intact.")
 
-    # Median imputation is fitted ONLY on training data to avoid test leakage.
-    imputer = SimpleImputer(strategy="median", keep_empty_features=True)
-    X_train_raw = imputer.fit_transform(X_train_raw)
-    X_test_raw = imputer.transform(X_test_raw)
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train_raw)
-    X_test = scaler.transform(X_test_raw)
-    X_scaled = X_train   # sample used below for importance/SHAP: real trained-model feature space
-    poly_feature_cols = feature_cols[:]
+    # Declared identifier names are a fixed schema rule. Data-dependent
+    # transformations are left to the pipeline fitted in each fold.
+    excluded = [col for col in X_train if col.lower() in
+                {"id", "index", "row_id", "record_id", "customer_id", "employee_id", "uuid"}]
+    if excluded:
+        eval_warnings.append("Identifier fields excluded by schema: " + ", ".join(excluded) + ".")
+        X_train, X_test = X_train.drop(columns=excluded), X_test.drop(columns=excluded)
+    if not len(X_train.columns):
+        return unavailable("No usable features after removing identifier columns")
 
-    primary_metric = "accuracy" if task_type == "classification" else "r2"
-    # On imbalanced classes, "highest accuracy" is won by a model that only predicts the majority class.
-    # Select by cross-validated MACRO-F1 there (every class counts equally); the reported score stays accuracy.
-    # "Clearly not balanced" = smallest class < 70% the size of the largest (churn at 27/73 qualifies; the
-    # separate `imbalanced` warning flag keeps its stricter < 30% threshold).
-    _ratio = imbalance.get("ratio", 1.0) if task_type == "classification" else 1.0
-    use_macro_selection = task_type == "classification" and _ratio < MACRO_SELECTION_RATIO
-    if use_macro_selection:
-        eval_warnings.append(f"Classes are unevenly sized (smallest/largest = {_ratio:.2f}): the best model was chosen by "
-                             f"cross-validated macro F1 (every class counts equally) instead of accuracy, so predicting only "
-                             f"the majority class cannot win by default.")
-    evaluation_protocol = {
-        "split": "hold-out test set",
-        "n_train": int(len(y_train)), "n_test": int(len(y_test)),
-        "n_train_before_cap": train_rows_before_cap, "train_sample_cap": max_train if train_cap_note else None,
-        "stratified": bool(split_kwargs.get("stratify") is not None),
-        "random_state": 42,
-        "reported_metric": primary_metric,
-        "selection_rule": ("highest cross-validated macro F1 on the training split (imbalanced classes; falls back to hold-out macro F1 if CV is not valid)"
-                           if use_macro_selection else
-                           "highest cross-validated score on the training split (falls back to hold-out score if CV is not valid)"),
+    encoder, labels, positive = None, [], None
+    imbalance = {}
+    if task == "classification":
+        encoder = LabelEncoder().fit(y_train)
+        labels = encoder.classes_.tolist()
+        if len(labels) != len(counts) or not set(y_test) <= set(labels):
+            return unavailable("The hold-out split cannot represent every class in training")
+        y_train, y_test = encoder.transform(y_train), encoder.transform(y_test)
+        if np.bincount(y_train).min() < 2 or len(np.unique(y_test)) != len(labels):
+            return unavailable("Class support is insufficient for stratified validation")
+        normalized = [item.lower() for item in labels]
+        if len(labels) == 2:
+            key = next((item for item in ("yes", "true", "1", "1.0", "positive", "subscribed") if item in normalized), None)
+            positive = normalized.index(key) if key is not None else None
+        imbalance = _class_imbalance(y_train)
+        imbalance["class_counts"] = {label: int(n) for label, n in zip(labels, np.bincount(y_train))}
+
+    primary = "accuracy" if stratified else "r2"
+    macro_selection = stratified and np.bincount(y_train).min() / np.bincount(y_train).max() < MACRO_SELECTION_RATIO
+    selection_key = "cv_f1_macro" if macro_selection else "cv_score"
+    selection_name = "macro F1" if macro_selection else ("accuracy" if stratified else "R²")
+
+    def train(features):
+        train_X, test_X = X_train[features], X_test[features]
+        results, selected, fitted = [], None, None
+        for name, estimator in _get_models(task):
+            pipeline = Pipeline([("preprocess", _preprocessor(train_X)), ("scale", StandardScaler()), ("model", estimator)])
+            try:
+                pipeline.fit(train_X, y_train)
+                metrics = _eval_metrics(pipeline, train_X, test_X, y_train, y_test, task, labels, positive, chronological)
+                score = metrics[selection_key]
+                if score is None or not np.isfinite(score):
+                    raise ValueError(metrics["cv_note"] or "Cross-validation produced no usable score")
+                model = {"name": name, "score": metrics[primary], "score_metric": primary, "cv_score": metrics["cv_score"],
+                         "selection_score": score, "metrics": metrics, "is_best": False}
+                if selected is None or score > selected["selection_score"]:
+                    selected, fitted = model, pipeline
+                results.append(model)
+            except Exception as exc:
+                results.append({"name": name, "score": 0, "metrics": {}, "is_best": False, "error": str(exc)})
+        if selected:
+            selected["is_best"] = True
+        return results, selected, fitted
+
+    features = list(X_train.columns)
+    models, winner, pipeline = train(features)
+    if not winner:
+        return unavailable("No model completed training and cross-validation", models)
+    preprocess, scaler, estimator = (pipeline.named_steps[key] for key in ("preprocess", "scale", "model"))
+    names = preprocess.get_feature_names_out().tolist()
+    transformed = pipeline[:-1].transform(X_test.iloc[:200])
+    numeric = next(cols for name, _, cols in preprocess.transformers_ if name == "numeric")
+    categorical = next(cols for name, _, cols in preprocess.transformers_ if name == "categorical")
+    mappings, defaults = {}, {}
+    if numeric:
+        defaults.update(zip(numeric, preprocess.named_transformers_["numeric"].statistics_.tolist()))
+    if categorical:
+        cat = preprocess.named_transformers_["categorical"]
+        mappings.update({col: values.tolist() for col, values in zip(categorical, cat.named_steps["encode"].categories_)})
+        defaults.update(zip(categorical, cat.named_steps["impute"].statistics_.tolist()))
+
+    try:
+        from agents.explainability import generate_shap_plots
+        shap = generate_shap_plots(estimator, transformed[:50], names, task, class_index=positive,
+                                   class_labels=labels, target=target)
+    except Exception as exc:
+        shap = {"available": False, "reason": str(exc)}
+    if shap.get("available"):
+        importance = [{"feature": item["feature"], "importance": item["mean_abs_shap"], "method": "shap"}
+                      for item in shap["top_features"]]
+    else:
+        importance = _get_feature_importance(estimator, transformed, names, X_eval=transformed,
+                                             y_eval=y_test[:len(transformed)], scoring="f1_macro" if stratified else "r2")
+
+    features_with_timing = {col: entry for col, entry in (availability or {}).items() if col in features}
+    excluded_for_timing = [col for col in features if col in features_with_timing or any(
+        col == f"{source}_{suffix}" for source in (availability or {})
+        for suffix in ("year", "month", "day", "dow", "roll3", "lag1", "lag3")
+    )]
+    restricted = [col for col in features if col not in excluded_for_timing]
+    comparison = None
+    if excluded_for_timing and restricted:
+        alternatives, alternate, _ = train(restricted)
+        comparison = {"excluded": excluded_for_timing, "models": alternatives,
+                      "best_model": (alternate or {}).get("name"), "best_metrics": (alternate or {}).get("metrics", {})}
+    future = _future_prediction(pipeline, features, X.assign(**{target: y_raw}), target) if chronological else {}
+    package_versions = {}
+    for package in ("numpy", "pandas", "xgboost", "lightgbm", "catboost", "shap"):
+        try:
+            package_versions[package] = version(package)
+        except PackageNotFoundError:
+            continue
+    protocol = {
+        "target": target, "split": "chronological hold-out" if chronological else "hold-out test set",
+        "n_train": len(y_train), "n_test": len(y_test), "test_fraction": fraction,
+        "n_train_before_cap": before_cap, "train_sample_cap": cap if before_cap > cap else None,
+        "stratified": stratified, "random_state": 42,
+        "reported_metric": primary, "selection_rule": f"Highest training cross-validation {selection_name}",
+        "cv_type": "StratifiedKFold" if stratified else ("TimeSeriesSplit" if chronological else "KFold"),
+        "cv_folds": winner["metrics"]["cv_folds"],
+        "positive_class": labels[positive] if positive is not None else None,
+        "excluded_unlabeled_rows": int((~valid).sum()), "sklearn_version": sklearn.__version__,
+        "python_version": platform.python_version(), "package_versions": package_versions,
     }
-
-    model_results, best_model_obj, best_sel, best_name = [], None, -np.inf, ""
-    for name, clf in _get_models(task_type):
-        try:
-            clf.fit(X_train, y_train)
-            metrics = _eval_metrics(clf, X_train, X_test, y_train, y_test, task_type, n_classes, det.get("is_timeseries", False))
-            holdout = metrics.get(primary_metric)
-            cvm = metrics.get("cv_score")
-            if use_macro_selection:
-                cvf = metrics.get("cv_f1_macro")
-                sel = cvf if cvf is not None else metrics.get("f1_macro")
-            else:
-                sel = cvm if cvm is not None else holdout
-            # "score" is ALWAYS the hold-out metric so comparison table == detailed metrics.
-            model_results.append({
-                "name": name, "score": round(float(holdout), 4), "score_metric": primary_metric,
-                "cv_score": cvm, "selection_score": round(float(sel), 4),
-                "metrics": metrics, "is_best": False, "_obj": clf,
-            })
-            if sel > best_sel:
-                best_sel, best_model_obj, best_name = sel, clf, name
-        except Exception as e:
-            model_results.append({"name": name, "score": 0, "metrics": {}, "is_best": False, "error": str(e)})
-
-    for m in model_results:
-        m["is_best"] = (m["name"] == best_name)
-    best_entry = next((m for m in model_results if m["is_best"]), None)
-    best_score = float(best_entry["score"]) if best_entry else 0.0
-
-    # Weighted metrics hide poor minority-class results; say so when the gap is large (informational, not a hold).
-    if best_entry and task_type == "classification":
-        bm_ = best_entry.get("metrics") or {}
-        if bm_.get("f1") is not None and bm_.get("f1_macro") is not None and bm_["f1"] - bm_["f1_macro"] >= 0.2:
-            eval_warnings.append(f"Weighted F1 ({bm_['f1']:.0%}) is much higher than macro F1 ({bm_['f1_macro']:.0%}): "
-                                 f"the model predicts the larger classes well but the smaller classes poorly.")
-
-    feature_importances = []
-    if best_model_obj is not None:
-        _imp_scoring = ("f1_macro" if use_macro_selection else "accuracy") if task_type == "classification" else "r2"
-        feature_importances = _get_feature_importance(best_model_obj, X_scaled[:200], poly_feature_cols,
-                                                      X_eval=X_test, y_eval=y_test, scoring=_imp_scoring)
-
-    shap_plots = {"available": False, "reason": "not computed"}
-    if best_model_obj is not None:
-        try:
-            from agents.explainability import generate_shap_plots
-            shap_plots = generate_shap_plots(best_model_obj, X_scaled[:200], poly_feature_cols, task_type)
-        except Exception as e:
-            shap_plots = {"available": False, "reason": str(e)}
-
-    future_pred = {}
-    if det.get("is_timeseries") and task_type == "regression" and best_model_obj is not None:
-        future_pred = _future_prediction(best_model_obj, scaler, feature_cols, df_feat, target_col)
-
-    clean_models = [{k: v for k, v in m.items() if k != "_obj"} for m in model_results]
-
     return {
-        "models":               clean_models,
-        "task_type":            task_type,
-        "target_column":        target_col,
-        "best_model":           best_name,
-        "best_score":           round(float(best_score), 4),
-        "feature_importances":  feature_importances,
-        "shap_plots":           shap_plots,
-        "engineered_features":  list(engineered.keys()),
-        "feature_count":        len(feature_cols),
-        "future_prediction":    future_pred,
-        "class_imbalance":      imbalance,
-        "data_relationships":   _data_relationships(df, target_col),
-        "exploratory_mode":     False,
-        "score_metric":         primary_metric,
-        "evaluation_protocol":  evaluation_protocol,
-        "evaluation_warnings":  eval_warnings,
-        "selection_metric":     "cv_f1_macro" if use_macro_selection else "cv_score",
-        # Private objects
-        "_model_obj":    best_model_obj,
-        "_scaler_obj":   scaler,
-        "_imputer_obj":  imputer,
-        "_feature_cols": feature_cols,
-        "_le_target":    le_target,
-        "_numeric_cols": det.get("numeric_cols", []),
-        "_categorical_mappings": categorical_mappings,
+        "models": models, "task_type": task, "target_column": target, "best_model": winner["name"],
+        "best_score": winner["score"], "feature_importances": importance, "shap_plots": shap,
+        "engineered_features": engineered, "feature_count": len(features), "future_prediction": future,
+        "class_imbalance": imbalance, "data_relationships": relationships, "exploratory_mode": False,
+        "score_metric": primary, "evaluation_protocol": protocol, "evaluation_warnings": eval_warnings,
+        "selection_metric": selection_key, "feature_availability": availability or {},
+        "availability_comparison": comparison,
+        "_model_obj": estimator, "_scaler_obj": scaler, "_preprocessor_obj": preprocess,
+        "_feature_cols": features, "_le_target": encoder, "_numeric_cols": numeric,
+        "_categorical_mappings": mappings, "_feature_defaults": defaults,
     }
