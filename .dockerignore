@@ -9,6 +9,7 @@ __pycache__/
 .vscode/
 uploads/
 *.csv
+!sample_data/employee_attrition_sample.csv
 *.log
 *.db
 *.pdf

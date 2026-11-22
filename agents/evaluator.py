@@ -25,6 +25,9 @@ away whether a report was trustworthy the moment the job finishes.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+import os
+
 REQUIRED_KEYS = [
     "report", "headline", "score_meaning", "top_recommendation",
     "confidence", "should_i_worry", "risk_score", "next_steps",
@@ -57,12 +60,6 @@ def _check_confidence_vs_reality(rep: dict, quality: float, best_score: float, r
                 f"Reporter claims 'high' confidence, but quality={quality}%, "
                 f"best_score={round(best_score,3)}, rows={rows} don't fully support that."
             ),
-        })
-    if claimed == "low" and quality > 90 and best_score > 0.85 and rows >= SMALL_SAMPLE_THRESHOLD:
-        flags.append({
-            "check": "confidence_vs_reality",
-            "severity": "flag",
-            "message": "Reporter claims 'low' confidence despite strong quality/score/sample size — possibly overcautious.",
         })
     return flags
 
@@ -213,31 +210,75 @@ def _check_degenerate_evaluation(ml: dict) -> list[dict]:
 
 
 
-def _check_no_better_than_baseline(ml: dict) -> list[dict]:
-    """A classifier that does not beat 'always predict the most common class' has learned nothing useful
-    (typical causes: dirty/over-split target labels, no signal in the features, tiny hold-out)."""
+@dataclass(frozen=True)
+class BaselineThresholds:
+    equal_band: float = 0.001
+    substantial_gain: float = 0.02
+    minimum_positive_recall: float = 0.60
+    minority_ratio: float = 0.30
+
+    @classmethod
+    def from_environment(cls):
+        defaults = cls()
+        names = {
+            "equal_band": "DATAMIND_BASELINE_EQUAL_BAND",
+            "substantial_gain": "DATAMIND_BASELINE_SUBSTANTIAL_GAIN",
+            "minimum_positive_recall": "DATAMIND_MIN_POSITIVE_RECALL",
+            "minority_ratio": "DATAMIND_MINORITY_RATIO",
+        }
+        settings = cls(**{field: float(os.environ.get(name, getattr(defaults, field))) for field, name in names.items()})
+        if not (0 <= settings.equal_band < settings.substantial_gain <= 1
+                and 0 <= settings.minimum_positive_recall <= 1 and 0 <= settings.minority_ratio <= 1):
+            raise ValueError("Guardrails thresholds must be between zero and one, with a substantial gain above the equality band.")
+        return settings
+
+
+def compare_baseline(metrics, thresholds=BaselineThresholds()):
+    accuracy, baseline = metrics.get("accuracy"), metrics.get("majority_baseline_accuracy")
+    if accuracy is None or baseline is None:
+        return {}
+    delta = accuracy - baseline
+    if delta < -thresholds.equal_band:
+        outcome = "below"
+        summary = f"Model accuracy falls below the hold-out majority-class baseline by {-delta * 100:.3f} percentage points."
+    elif abs(delta) <= thresholds.equal_band:
+        outcome = "approximately_equal"
+        summary = f"Model accuracy is approximately equal to the hold-out majority-class baseline. Difference: {delta * 100:+.3f} percentage points."
+    else:
+        outcome = "slightly_above" if delta < thresholds.substantial_gain else "substantially_above"
+        summary = f"Model accuracy exceeds the hold-out majority-class baseline by {delta * 100:.3f} percentage points."
+        if outcome == "slightly_above":
+            summary += " The improvement is limited."
+    return {"outcome": outcome, "accuracy": accuracy, "baseline": baseline,
+            "difference_percentage_points": delta * 100, "message": summary}
+
+
+def _check_classification(metrics, thresholds):
+    comparison = compare_baseline(metrics, thresholds)
+    flags = []
+
+    def flag(check, message):
+        flags.append({"check": check, "severity": "flag", "message": message})
+
+    if comparison and comparison["outcome"] != "substantially_above":
+        flag("majority_baseline", comparison["message"])
+    macro, macro_baseline = metrics.get("macro_f1"), metrics.get("baseline_macro_f1")
+    if macro is not None and macro_baseline is not None and macro <= macro_baseline:
+        flag("macro_f1", f"Hold-out macro F1 is {macro:.1%} against a majority baseline of {macro_baseline:.1%}. Review performance across classes.")
+    recall = metrics.get("positive_recall")
+    if recall is not None and recall < thresholds.minimum_positive_recall:
+        flag("positive_recall", f"Positive-class recall is {recall:.1%}. Review missed positive cases before using the model.")
+    support = list(metrics.get("holdout_support", {}).values())
+    if support and max(support) and min(support) / max(support) < thresholds.minority_ratio:
+        flag("class_imbalance", "The hold-out labels are imbalanced. Review macro F1 and class-level errors alongside accuracy.")
+    return comparison, flags
+
+
+def _classification_review(ml, thresholds):
     if ml.get("task_type") != "classification":
-        return []
-    models = [m for m in (ml.get("models") or []) if not m.get("error")]
-    best = next((m for m in models if m.get("is_best")), None)
-    mt = (best or {}).get("metrics") or {}
-    cm, acc = mt.get("confusion_matrix"), mt.get("accuracy")
-    if not cm or acc is None:
-        return []
-    total = sum(sum(r) for r in cm)
-    if total <= 0:
-        return []
-    baseline = max(sum(r) for r in cm) / total
-    margin = max(0.02, (baseline * (1 - baseline) / total) ** 0.5)   # ~1 standard error: small hold-outs are noisy
-    if baseline < 1.0 and acc <= baseline + margin:
-        predicted = sum(1 for j in range(len(cm[0])) if sum(row[j] for row in cm) > 0)
-        single = " The selected model predicts a single class for every hold-out row." if predicted == 1 else ""
-        return [_flag("no_better_than_baseline",
-                      f"Best model accuracy ({acc:.1%}) is not better than always predicting the most common class "
-                      f"({baseline:.1%}) on the hold-out set.{single} Accuracy alone can hide a useful model on imbalanced "
-                      f"data, so also check per-class recall / macro F1; if recall is poor, look for inconsistent target "
-                      f"labels (e.g. 'Yes'/'yes'/'Y') or weak features.", "warn")]
-    return []
+        return {}, []
+    metrics = next((item.get("metrics", {}) for item in ml.get("models", []) if item.get("is_best")), {})
+    return _check_classification(metrics, thresholds)
 
 
 def _check_leakage(ml: dict) -> list[dict]:
@@ -277,7 +318,7 @@ def _check_selection_mismatch(ml: dict) -> list[dict]:
 
 def _check_regression_no_skill(ml: dict) -> list[dict]:
     """R² <= 0 means the model is no better than (or worse than) always predicting the mean — it has
-    learned nothing usable. This is the regression counterpart of _check_no_better_than_baseline, and is
+    learned nothing usable. This is the regression counterpart of the classification baseline check, and is
     what should stop a report from calling a negative-R² model's output a reliable forecast."""
     if ml.get("task_type") != "regression":
         return []
@@ -340,7 +381,6 @@ def run_consistency_checks(rep: dict, det: dict, ml: dict, dataset_summary: dict
     flags += _check_model_consistency(ml, rep)
     flags += _check_summary_consistency(dataset_summary or {})
     flags += _check_degenerate_evaluation(ml)
-    flags += _check_no_better_than_baseline(ml)
     flags += _check_leakage(ml)
     flags += _check_requested_target(requested_target, ml)
     flags += _check_selection_mismatch(ml)
@@ -371,7 +411,7 @@ def merge_flags(eval_result: dict, extra_flags: list[dict]) -> dict:
     return out
 
 
-def run_evaluator(rep: dict, det: dict, ml: dict) -> dict:
+def run_evaluator(rep: dict, det: dict, ml: dict, thresholds=BaselineThresholds()) -> dict:
     """Entry point: called from run_pipeline() right after Reporter finishes."""
     quality    = det.get("quality_score", 0) or 0
     rows       = (det.get("original_shape") or [0])[0]
@@ -379,9 +419,13 @@ def run_evaluator(rep: dict, det: dict, ml: dict) -> dict:
 
     flags = []
     flags += _check_completeness(rep)
-    flags += _check_confidence_vs_reality(rep, quality, best_score, rows)
+    if ml.get("task_type") in ("classification", "regression") and ml.get("best_model"):
+        flags += _check_confidence_vs_reality(rep, quality, best_score, rows)
     flags += _check_risk_vs_worry(rep)
     flags += _check_small_sample(rows)
+
+    baseline, performance_flags = _classification_review(ml, thresholds)
+    flags.extend(performance_flags)
 
     if any(f["severity"] == "fail" for f in flags):
         status = "FAILED"
@@ -394,4 +438,5 @@ def run_evaluator(rep: dict, det: dict, ml: dict) -> dict:
         "status": status,
         "flags": flags,
         "checked_fields": REQUIRED_KEYS,
+        "baseline_comparison": baseline,
     }
