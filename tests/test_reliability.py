@@ -247,3 +247,95 @@ def test_container_contract_and_frontend_asset():
         import re
         asset = re.search(r'src="(/assets/[^"]+\.js)"', body).group(1)
         assert client.get(asset).status_code == 200
+
+
+def test_chat_greets_with_or_without_an_analysis(monkeypatch):
+    import app as datamind
+
+    def unexpected_lookup(*args, **kwargs):
+        pytest.fail("A greeting should not look up analysis evidence")
+
+    monkeypatch.setattr(datamind.data_store, "load_meta", unexpected_lookup)
+    with datamind.app.test_client() as client:
+        assert client.post("/api/guest").status_code == 200
+        for message, job_id in (("hi", ""), ("  Hi!  ", "job_" + "a" * 32), ("Hello there!", "")):
+            result = client.post("/api/chat", json={"message": message, "job_id": job_id})
+            assert result.status_code == 200
+            assert result.json["source"] == "greeting"
+            assert result.json["reply"].startswith("Hi!")
+
+        question = client.post("/api/chat", json={"message": "Hi, how many rows are there?"})
+        assert question.json["source"] == "limitation"
+
+
+def test_chat_overview_uses_dataset_specific_evidence():
+    evidence = {"dataset": {"rows": 23, "columns": 4}, "target": {"name": "outcome"}}
+    for question in ("Summarize my dataset", "Give me an overview"):
+        answer, _ = analysis_evidence.resolve_question(question, evidence)
+        assert "23 rows and 4 columns" in answer and "[dataset]" in answer
+        assert "outcome" in answer and "[target]" in answer
+    answer, _ = analysis_evidence.resolve_question("Summarize my dataset", {})
+    assert not answer
+
+@pytest.mark.parametrize(("question", "expected"), [
+    ("Which metric was used to select XGBoost?", "cross-validation macro F1"),
+    ("Provide the five highest SHAP features with their numerical importance values.", "0.123"),
+    ("Does SHAP feature importance establish causation?", "separate causal evidence"),
+    ("List all warnings raised by the Guardrails agent.", "Training inputs unavailable"),
+    ("Is the selected model ready for production deployment?", "readiness is unverified"),
+    ("Does human approval guarantee model reliability?", "review decision"),
+    ("Does 89.3% accuracy mean each individual prediction has an 89.3% probability of being correct?", "fraction of correct predictions"),
+    ("What is the ROC-AUC score of the selected model?", "unavailable"),
+    ("What was the bank's total revenue generated from these marketing campaigns?", "total is unavailable"),
+])
+def test_reported_chat_questions(question, expected):
+    evidence = {
+        "bank_marketing": True, "target": {"name": "y"}, "dataset": {"missing_by_column": {"campaign": 0}},
+        "model": {"name": "XGBoost", "models": [{"name": "XGBoost", "is_best": True}],
+                  "evaluation": {"selection_rule": "Highest training cross-validation macro F1"},
+                  "shap": {"top_features": [{"feature": "duration", "mean_abs_shap": 0.123}]}},
+        "guardrails": {"status": "FLAGGED", "flags": [{"check": "availability", "message": "Training inputs unavailable"}]},
+    }
+    reply, _ = analysis_evidence.resolve_question(question, evidence)
+    assert expected in reply
+
+
+def test_revenue_query_does_not_sum_campaign_contacts(bank_frame):
+    from agents import query_engine
+
+    result = query_engine.answer_question(bank_frame, "What was the bank's total revenue generated from these marketing campaigns?")
+    assert result["status"] == "clarify"
+    assert "revenue column" in result["text"]
+
+
+def test_unseen_questions_through_chat_api(bank_analysis, monkeypatch):
+    import json
+    import app as datamind
+
+    _, _, evidence = bank_analysis
+    evidence["model"]["evaluation"]["selection_rule"] = "Highest training cross-validation macro F1"
+    evidence["model"]["shap"] = {"top_features": [{"feature": "duration", "mean_abs_shap": 0.081}]}
+    job_id = "job_" + "a" * 32
+    with datamind.app.test_client() as client:
+        assert client.post("/api/guest").status_code == 200
+        with client.session_transaction() as session:
+            owner = session["guest_id"]
+        monkeypatch.setitem(datamind.jobs, job_id, {
+            "user": owner, "status": "done",
+            "result": {"evidence": evidence, "eval": {"status": "PASSED", "flags": []}},
+        })
+        monkeypatch.setattr(datamind, "GROQ_API_KEY", "")
+        cases = json.loads(Path("evaluation/unseen_questions.json").read_text())
+        for question, expected in cases:
+            response = client.post("/api/chat", json={"message": question, "job_id": job_id})
+            assert response.status_code == 200
+            reply = response.json["reply"]
+            assert all(fragment in reply for fragment in expected), (question, reply)
+        for question, expected in [
+            ("hi", ["Hi!"]),
+            ("How many customers subscribed and how many did not subscribe?", ["521", "4,000"]),
+            ("Is the selected model ready for production deployment? Explain why.", ["unverified", "prediction time"]),
+        ]:
+            reply = client.post("/api/chat", json={"message": question, "job_id": job_id}).json["reply"]
+            assert all(fragment in reply for fragment in expected), reply
+            assert "remaining part" not in reply

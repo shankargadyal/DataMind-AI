@@ -1053,10 +1053,13 @@ def chat():
         return err
     body = request.get_json(silent=True) or {}
     message = (body.get("message") or "").strip()
-    job_id = body.get("job_id") or ""
-    api_key = (body.get("api_key") or "").strip() or GROQ_API_KEY
     if not message:
         return jsonify(error="Empty message"), 400
+    if re.fullmatch(r"(?:hi|hello|hey)(?:\s+there)?[.!?]*", message, re.IGNORECASE):
+        return jsonify(reply="Hi! What would you like to know about your data?", source="greeting")
+
+    job_id = body.get("job_id") or ""
+    api_key = (body.get("api_key") or "").strip() or GROQ_API_KEY
     if not job_id:
         return jsonify(reply="Upload a dataset and open its analysis first.", source="limitation")
 
@@ -1076,6 +1079,8 @@ def chat():
     evidence = result.get("evidence") or (meta or {}).get("analysis_evidence") or {}
     if not evidence and (meta or {}).get("selected_target"):
         evidence = {"target": {"name": meta["selected_target"]}}
+    if result.get("eval") and "guardrails" not in evidence:
+        evidence = {**evidence, "guardrails": result["eval"]}
     history = _chats.setdefault(job_id, [])
     previous = next((item["content"] for item in reversed(history) if item["role"] == "user"), "")
 
@@ -1089,7 +1094,9 @@ def chat():
     raw = None
     clauses = [clause.strip() for clause in clauses if clause.strip()]
     for clause in clauses:
-        facts, _ = analysis_evidence.resolve_question(clause, evidence, previous)
+        if lines and re.fullmatch(r"(?:please )?explain why[.! ]*", clause, re.I) and "deployment" in intents:
+            continue
+        facts, intents = analysis_evidence.resolve_question(clause, evidence, previous)
         if facts:
             lines.extend(facts.splitlines())
             continue
@@ -1111,7 +1118,7 @@ def chat():
         return finish(facts, "computed", **extra)
 
     limitation = "The available evidence does not support a verified answer to that question."
-    partial = facts + "\n\nVerified evidence is unavailable for the remaining part of the question." if facts else limitation
+    partial = facts + "\n\nVerified evidence is unavailable for the remaining part of the question." if facts else (limitation + " Try asking how many rows are in the dataset or which target was selected.")
 
     def limited():
         return finish(partial, "computed" if facts else "limitation", **extra)
@@ -1481,6 +1488,7 @@ def run_pipeline(job_id, filepath, query, api_key, filename, target_column="", m
                 log(job_id, f"[AG4b][{f['severity'].upper()}] {f['check']}: {f['message']}")
         except Exception as cons_err:
             log(job_id, f"[WARN] Consistency checks skipped: {cons_err}")
+        evidence["guardrails"] = eval_result
         df_raw = None   # release memory; chat reloads it from the data store on demand
 
         # Ensure distribution_data is populated from multiple sources

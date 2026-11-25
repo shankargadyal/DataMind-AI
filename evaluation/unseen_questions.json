@@ -1,0 +1,13 @@
+[
+  ["Which column is the active prediction target?", ["target", "y"]],
+  ["Report class counts for the target.", ["521", "4,000"]],
+  ["Which score ranked the candidate models?", ["cross-validation", "macro F1"]],
+  ["Show global SHAP importance for the model.", ["mean absolute SHAP", "duration"]],
+  ["Can SHAP prove that a variable causes the outcome?", ["causal evidence"]],
+  ["Which evaluator findings were recorded?", ["flags"]],
+  ["Is this classifier ready to go live?", ["unverified"]],
+  ["Can reviewer sign-off guarantee reliable outputs?", ["review decision"]],
+  ["Is accuracy a probability for one customer?", ["calibration"]],
+  ["Give the area under the ROC curve.", ["unavailable"]],
+  ["Calculate revenue for the outreach campaign.", ["unavailable"]]
+]

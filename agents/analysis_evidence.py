@@ -65,6 +65,15 @@ def build_evidence(raw, det, ml, selected_target, identity, availability):
     }
 
 
+def missing_financial_measure(question, columns):
+    """Detect ungrounded financial measures before another numeric column is aggregated."""
+    if len(columns) == 0:
+        return None
+    terms = re.findall(r"\b(revenue|profit|turnover)\b", question.lower())
+    names = [str(name).lower() for name in columns]
+    return next((term for term in terms if not any(term in name for name in names)), None)
+
+
 def resolve_question(question, evidence, previous_question=""):
     """Return computed facts and the intents they cover. Unresolved compound clauses are reported."""
     q = question.lower().strip()
@@ -88,6 +97,46 @@ def resolve_question(question, evidence, previous_question=""):
     counts = target.get("distribution", {})
     bank = evidence.get("bank_marketing")
     rows = dataset.get("rows")
+    measure = missing_financial_measure(q, dataset.get("missing_by_column", {}))
+    if measure:
+        add("missing measure", "dataset", f"The uploaded schema contains no identified {measure} field. Its total is unavailable.")
+    if re.search(r"guardrail|evaluator", q) and re.search(r"warn|flag|issue|finding|alert", q):
+        review = evidence.get("guardrails") or {}
+        if review.get("status") in (None, "NOT_EVALUATED"):
+            missing("guardrails", "guardrails", "A completed Guardrails evaluation")
+        else:
+            flags = review.get("flags", [])
+            for flag in flags:
+                add("guardrails", "guardrails", f"{flag['check']}: {flag['message']}")
+            if not flags:
+                add("guardrails", "guardrails", "Guardrails recorded no flags.")
+    if re.search(r"(?:metric|score|criterion).*?(?:select|rank|choos|chosen)|(?:select|rank|chosen).*?(?:metric|criterion|rule)", q):
+        rule = model.get("evaluation", {}).get("selection_rule")
+        if rule:
+            add("selection", "models/evaluation", f"Model selection rule: {rule}.")
+        else:
+            missing("selection", "models/evaluation", "The recorded model selection rule")
+    if re.search(r"production|deploy|go live", q) and re.search(r"deploy|ready|readiness|go live", q):
+        add("deployment", "evaluation guidance", "Production readiness is unverified. Hold-out evaluation alone cannot establish performance on future customers or availability of inputs at prediction time.")
+        for column, entry in model.get("availability", {}).items():
+            add("deployment", "models/availability", f"Prediction-time constraint for {column}: {entry['reason']}")
+    if re.search(r"approv|sign.off|human review", q) and re.search(r"reliab|guarantee|trust", q):
+        add("approval", "review guidance", "Approval records a review decision. Reliability requires representative validation and ongoing monitoring.")
+    if "accuracy" in q and re.search(r"individual|each prediction|single (?:prediction|customer)|one customer", q):
+        add("accuracy meaning", "metric definition", "Hold-out accuracy is the fraction of correct predictions across the test set. An individual probability requires a model probability estimate and evidence of calibration.")
+    if "shap" in q and re.search(r"caus", q):
+        add("causation", "SHAP interpretation", "SHAP attributes model output to features. Establishing a causal effect requires separate causal evidence.")
+    overview = re.fullmatch(
+        r"(?:please )?(?:(?:summari[sz]e|describe|tell me about) (?:my |the |this )?"
+        r"(?:data(?:set)?|analysis|results)|(?:give me |show me )?(?:a |an )?"
+        r"(?:dataset |data |analysis )?(?:overview|summary)|what is (?:this|my) dataset about)[.! ]*", q
+    )
+    if overview and rows is not None and dataset.get("columns") is not None:
+        add("overview", "dataset", f"The uploaded dataset contains {rows:,} rows and {dataset['columns']:,} columns.")
+        if target_name:
+            add("target", "target", f"The analysis target is `{target_name}`.")
+        if model.get("name"):
+            add("model", "models", f"The selected model is {model['name']}.")
     if re.search(r"\b(?:prediction|model|selected|active|chosen|analysis) target\b|\btarget (?:is|column|variable)\b|\bwhat.*\btarget\b", q):
         if target_name:
             description = target.get("description")
@@ -127,7 +176,7 @@ def resolve_question(question, evidence, previous_question=""):
         else:
             missing("model", "models", "A selected model")
     metric_patterns = {
-        "accuracy": r"\baccuracy\b", "macro_f1": r"\bmacro[- ](?:average[d]?[- ])?f1\b",
+        "roc_auc": r"\broc[- ]?auc\b|\bauc\b|area under the roc", "accuracy": r"\baccuracy\b", "macro_f1": r"\bmacro[- ](?:average[d]?[- ])?f1\b",
         "weighted_f1": r"\bweighted[- ](?:average[d]?[- ])?f1\b", "f1": r"\bf1\b",
         "recall": r"\brecall\b|\bsensitivity\b", "precision": r"\bprecision\b",
         "r2": r"\br[²2]\b", "mae": r"\bmae\b|\bmean absolute error\b",
@@ -163,7 +212,7 @@ def resolve_question(question, evidence, previous_question=""):
                 if value is None:
                     missing("metrics", source, f"{item['name']} {label}")
                 else:
-                    formatted = f"{value:.4g}" if key in {"r2", "mae", "rmse"} else f"{value:.1%}"
+                    formatted = f"{value:.4g}" if key in {"r2", "mae", "rmse", "roc_auc"} else f"{value:.1%}"
                     add("metrics", source, f"{item['name']} hold-out {label}: {formatted}.")
             if matrix_requested:
                 if metrics.get("confusion_matrix"):
@@ -211,7 +260,7 @@ def resolve_question(question, evidence, previous_question=""):
             add("distribution", "target/distribution", f"For `{target_name}`, {detail}.")
         else:
             missing("distribution", "target/distribution", "The requested class distribution")
-    if re.search(r"\bshap\b|\b(?:top|important|importance) features?\b|\bfeature importance\b", q):
+    if "causation" not in intents and re.search(r"\bshap\b|\b(?:top|important|importance) features?\b|\bfeature importance\b", q):
         shap = model.get("shap", {})
         local = bool(re.search(r"\blocal\b|waterfall|single prediction", q))
         ranking = shap.get("top_features") if "shap" in q or local else model.get("importance")
@@ -221,8 +270,15 @@ def resolve_question(question, evidence, previous_question=""):
             scope = ""
             if "shap" in q and shap.get("explained_class") is not None:
                 scope = f" for class `{shap['explained_class']}` on the {shap['output_scale']} scale"
+            ranked = []
+            for feature in ranking[:5]:
+                label = feature["feature"]
+                if "shap" in q:
+                    value = feature.get("mean_abs_shap")
+                    label += f" (mean absolute SHAP: {value})" if value is not None else " (magnitude unavailable)"
+                ranked.append(label)
             add("shap", "models/shap" if "shap" in q else "models/importance",
-                f"Leading features for `{target_name}`{scope}: " + ", ".join(f["feature"] for f in ranking[:5]) +
+                f"Leading features for `{target_name}`{scope}: " + ", ".join(ranked) +
                 ". These describe model behavior and statistical associations.")
         else:
             missing("shap", "models/shap", "The requested feature explanation")
