@@ -247,3 +247,22 @@ def test_container_contract_and_frontend_asset():
         import re
         asset = re.search(r'src="(/assets/[^"]+\.js)"', body).group(1)
         assert client.get(asset).status_code == 200
+
+
+def test_chat_greets_with_or_without_an_analysis(monkeypatch):
+    import app as datamind
+
+    def unexpected_lookup(*args, **kwargs):
+        pytest.fail("A greeting should not look up analysis evidence")
+
+    monkeypatch.setattr(datamind.data_store, "load_meta", unexpected_lookup)
+    with datamind.app.test_client() as client:
+        assert client.post("/api/guest").status_code == 200
+        for message, job_id in (("hi", ""), ("  Hi!  ", "job_" + "a" * 32), ("Hello there!", "")):
+            result = client.post("/api/chat", json={"message": message, "job_id": job_id})
+            assert result.status_code == 200
+            assert result.json["source"] == "greeting"
+            assert result.json["reply"].startswith("Hi!")
+
+        question = client.post("/api/chat", json={"message": "Hi, how many rows are there?"})
+        assert question.json["source"] == "limitation"

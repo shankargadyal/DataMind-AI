@@ -1053,10 +1053,13 @@ def chat():
         return err
     body = request.get_json(silent=True) or {}
     message = (body.get("message") or "").strip()
-    job_id = body.get("job_id") or ""
-    api_key = (body.get("api_key") or "").strip() or GROQ_API_KEY
     if not message:
         return jsonify(error="Empty message"), 400
+    if re.fullmatch(r"(?:hi|hello|hey)(?:\s+there)?[.!?]*", message, re.IGNORECASE):
+        return jsonify(reply="Hi! What would you like to know about your data?", source="greeting")
+
+    job_id = body.get("job_id") or ""
+    api_key = (body.get("api_key") or "").strip() or GROQ_API_KEY
     if not job_id:
         return jsonify(reply="Upload a dataset and open its analysis first.", source="limitation")
 
