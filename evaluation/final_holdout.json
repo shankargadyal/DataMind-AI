@@ -1,0 +1,12 @@
+[
+  {"question":"How many actual yes cases were labeled no?", "requires":["63","predicted no"]},
+  {"question":"On the hold-out, count the correctly classified cases.", "requires":["806","905"]},
+  {"question":"Could high accuracy mask weak detection of subscribers?", "requires":["39.4%","88.5%","Macro F1"]},
+  {"question":"Contrast weighted and macro F1 for the winning classifier.", "requires":["support","equally"]},
+  {"question":"Which inputs would a caller lack before the call starts?", "requires":["duration"], "excludes":["records"]},
+  {"question":"How meaningful was the baseline gain according to Guardrails?", "requires":["unavailable"], "excludes":["substantially above"]},
+  {"question":"What annual wages are recorded for customers?", "requires":["wages","unavailable"]},
+  {"question":"Should we expect the same hit rate on next campaign customers?", "requires":["future performance"], "excludes":["4,521"]},
+  {"question":"Does a clean dataset by itself ensure reliable predictions?", "requires":["representative","evaluation"]},
+  {"question":"Could changing the length of a call cause a subscription?", "requires":["Confounding","causal evidence"]}
+]

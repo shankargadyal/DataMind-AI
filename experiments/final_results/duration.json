@@ -1,0 +1,151 @@
+{
+  "dataset_sha256": "dc8d576e9bda0f41ee891251bd84bab9a39ce576cba715aac08adc2374a01fde",
+  "target": "y",
+  "seed": 42,
+  "test_fraction": 0.2,
+  "stratified": true,
+  "train_rows": 3616,
+  "test_rows": 905,
+  "train_index_sha256": "474753855ef65bc36b26565a00958879af7f3c8df449dec5b37fd5269bad1f2e",
+  "test_index_sha256": "1a18ee49247ca4a3c005a6108aaaa8a6ede332f0eae1540ec09008bc4ce19eb1",
+  "versions": {
+    "xgboost": "3.2.0",
+    "numpy": "2.2.6",
+    "pandas": "2.3.3",
+    "scikit-learn": "1.5.1"
+  },
+  "xgboost_parameters": {
+    "objective": "binary:logistic",
+    "enable_categorical": false,
+    "eval_metric": "logloss",
+    "missing": "NaN",
+    "n_estimators": 100,
+    "n_jobs": 1,
+    "random_state": 42,
+    "verbosity": 0,
+    "use_label_encoder": false
+  },
+  "arms": [
+    {
+      "include_duration": true,
+      "features": [
+        "age",
+        "job",
+        "marital",
+        "education",
+        "default",
+        "balance",
+        "housing",
+        "loan",
+        "contact",
+        "day",
+        "month",
+        "duration",
+        "campaign",
+        "pdays",
+        "previous",
+        "poutcome"
+      ],
+      "accuracy": 0.8906077348066298,
+      "precision": 0.8789292499477462,
+      "recall": 0.8906077348066298,
+      "macro_f1": 0.6961325966850829,
+      "weighted_f1": 0.8833552089374561,
+      "confusion_matrix": [
+        [
+          765,
+          36
+        ],
+        [
+          63,
+          41
+        ]
+      ],
+      "confusion_labels": [
+        "no",
+        "yes"
+      ],
+      "holdout_support": {
+        "no": 801,
+        "yes": 104
+      },
+      "majority_baseline_accuracy": 0.8850828729281768,
+      "baseline_macro_f1": 0.4695193434935522,
+      "majority_baseline_label": "no",
+      "train_majority_holdout_accuracy": 0.8850828729281768,
+      "f1": 0.8833552089374561,
+      "positive_class": "yes",
+      "positive_recall": 0.3942307692307692,
+      "positive_precision": 0.5324675324675324,
+      "positive_f1": 0.4530386740331492,
+      "binary_confusion": {
+        "tp": 41,
+        "fp": 36,
+        "fn": 63,
+        "tn": 765
+      },
+      "average_precision": 0.5119050498528214,
+      "roc_auc": 0.9131974455008163
+    },
+    {
+      "include_duration": false,
+      "features": [
+        "age",
+        "job",
+        "marital",
+        "education",
+        "default",
+        "balance",
+        "housing",
+        "loan",
+        "contact",
+        "day",
+        "month",
+        "campaign",
+        "pdays",
+        "previous",
+        "poutcome"
+      ],
+      "accuracy": 0.8806629834254144,
+      "precision": 0.8498941700711193,
+      "recall": 0.8806629834254144,
+      "macro_f1": 0.5976850632244468,
+      "weighted_f1": 0.8575475274933196,
+      "confusion_matrix": [
+        [
+          778,
+          23
+        ],
+        [
+          85,
+          19
+        ]
+      ],
+      "confusion_labels": [
+        "no",
+        "yes"
+      ],
+      "holdout_support": {
+        "no": 801,
+        "yes": 104
+      },
+      "majority_baseline_accuracy": 0.8850828729281768,
+      "baseline_macro_f1": 0.4695193434935522,
+      "majority_baseline_label": "no",
+      "train_majority_holdout_accuracy": 0.8850828729281768,
+      "f1": 0.8575475274933196,
+      "positive_class": "yes",
+      "positive_recall": 0.18269230769230768,
+      "positive_precision": 0.4523809523809524,
+      "positive_f1": 0.2602739726027397,
+      "binary_confusion": {
+        "tp": 19,
+        "fp": 23,
+        "fn": 85,
+        "tn": 778
+      },
+      "average_precision": 0.30466757158997054,
+      "roc_auc": 0.7153197925669836
+    }
+  ]
+}

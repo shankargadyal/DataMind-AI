@@ -1,4 +1,6 @@
 """Authoritative dataset and evaluation facts for analysis sessions."""
+from agents.evaluation_questions import interpret
+
 import hashlib
 import re
 
@@ -69,9 +71,10 @@ def missing_financial_measure(question, columns):
     """Detect ungrounded financial measures before another numeric column is aggregated."""
     if len(columns) == 0:
         return None
-    terms = re.findall(r"\b(revenue|profit|turnover)\b", question.lower())
+    terms = re.findall(r"\b(revenue|profit|turnover|salary|salaries|wages)\b", question.lower())
     names = [str(name).lower() for name in columns]
-    return next((term for term in terms if not any(term in name for name in names)), None)
+    aliases = {"salary": ("salary", "salaries"), "salaries": ("salary", "salaries"), "wages": ("wage",)}
+    return next((term for term in terms if not any(alias in name for alias in aliases.get(term, (term,)) for name in names)), None)
 
 
 def resolve_question(question, evidence, previous_question=""):
@@ -79,6 +82,9 @@ def resolve_question(question, evidence, previous_question=""):
     q = question.lower().strip()
     if re.fullmatch(r"(?:and\s+)?(?:what(?:'s| is)\s+)?(?:the\s+)?(?:percentage|rate|count|recall|precision|f1|accuracy)[?. ]*", q):
         q += " (context: " + previous_question.lower() + ")"
+    interpretation = interpret(q, evidence)
+    if interpretation:
+        return interpretation, {"interpretation"}
     dataset, target, model = (evidence.get(k, {}) for k in ("dataset", "target", "model"))
     quality = evidence.get("quality", {})
     parts = []
@@ -99,7 +105,8 @@ def resolve_question(question, evidence, previous_question=""):
     rows = dataset.get("rows")
     measure = missing_financial_measure(q, dataset.get("missing_by_column", {}))
     if measure:
-        add("missing measure", "dataset", f"The uploaded schema contains no identified {measure} field. Its total is unavailable.")
+        quantity = "total" if "total" in q else "quantity"
+        return f"The uploaded schema contains no identified {measure} field. The requested {quantity} is unavailable. [dataset]", {"missing measure"}
     if re.search(r"guardrail|evaluator", q) and re.search(r"warn|flag|issue|finding|alert", q):
         review = evidence.get("guardrails") or {}
         if review.get("status") in (None, "NOT_EVALUATED"):
@@ -143,10 +150,11 @@ def resolve_question(question, evidence, previous_question=""):
             add("target", "target", f"The prediction target is `{target_name}`" + (f", indicating {description}." if description else "."))
         else:
             missing("target", "target", "A prediction target")
-    if re.search(r"\b(?:rows|records|observations|samples|customers)\b", q) and not re.search(r"subscri|\bwhere\b|\bwith\b|\bmissing\b|\byes\b|\bpositive\b|\bduplicate|\btrain|hold.out|\bfor\b|\bwhy\b|\baverage\b", q):
+    timing = bool(re.search(r"prediction.time|before.*call|pre.call|feature availability|when.*available", q))
+    if not timing and re.search(r"how many|number of|count|dataset size|total", q) and re.search(r"\b(?:rows|records|observations|samples|customers)\b", q) and not re.search(r"subscri|\bwhere\b|\bwith\b|\bmissing\b|\byes\b|\bpositive\b|\bduplicate|\btrain|hold.out|\bfor\b|\bwhy\b|\baverage\b", q):
         if rows is not None:
             add("rows", "dataset", f"The uploaded dataset contains {rows:,} records.")
-    if re.search(r"\b(?:columns|variables)\b", q) and not re.search(r"\bmissing|top|important|feature|list|which|target|numeric|categorical|datetime|date", q):
+    if not timing and re.search(r"how many|number of|count|total", q) and re.search(r"\b(?:columns|variables)\b", q) and not re.search(r"\bmissing|top|important|feature|list|which|target|numeric|categorical|datetime|date", q):
         if dataset.get("columns") is not None:
             add("columns", "dataset", f"The uploaded dataset contains {dataset['columns']:,} columns.")
     if re.search(r"\bmissing\b|\bnulls?\b", q) and not re.search(r"by column|per column|which columns|most missing|where", q):
@@ -176,15 +184,20 @@ def resolve_question(question, evidence, previous_question=""):
         else:
             missing("model", "models", "A selected model")
     metric_patterns = {
-        "roc_auc": r"\broc[- ]?auc\b|\bauc\b|area under the roc", "accuracy": r"\baccuracy\b", "macro_f1": r"\bmacro[- ](?:average[d]?[- ])?f1\b",
+        "average_precision": r"\baverage precision\b", "roc_auc": r"\broc[- ]?auc\b|\bauc\b|area under the roc", "accuracy": r"\baccuracy\b", "macro_f1": r"\bmacro[- ](?:average[d]?[- ])?f1\b",
         "weighted_f1": r"\bweighted[- ](?:average[d]?[- ])?f1\b", "f1": r"\bf1\b",
         "recall": r"\brecall\b|\bsensitivity\b", "precision": r"\bprecision\b",
         "r2": r"\br[²2]\b", "mae": r"\bmae\b|\bmean absolute error\b",
         "rmse": r"\brmse\b|\broot mean squared error\b",
     }
     requested = [key for key, pattern in metric_patterns.items() if re.search(pattern, q)]
+    if "macro" in q and "weighted" in q and "f1" in q:
+        requested = list(dict.fromkeys([*requested, "macro_f1", "weighted_f1"]))
+        add("averaging", "metric definition", "Macro F1 weights classes equally. Weighted F1 weights each class by its hold-out support, so frequent classes contribute more.")
     if "macro_f1" in requested or "weighted_f1" in requested:
         requested.remove("f1")
+    if "average_precision" in requested and "precision" in requested:
+        requested.remove("precision")
     if "accuracy" in requested and "data accuracy" in q:
         requested.remove("accuracy")
         if "accuracy" in quality.get("dimensions", {}):
@@ -212,7 +225,7 @@ def resolve_question(question, evidence, previous_question=""):
                 if value is None:
                     missing("metrics", source, f"{item['name']} {label}")
                 else:
-                    formatted = f"{value:.4g}" if key in {"r2", "mae", "rmse", "roc_auc"} else f"{value:.1%}"
+                    formatted = f"{value:.4g}" if key in {"r2", "mae", "rmse", "roc_auc", "average_precision"} else f"{value:.1%}"
                     add("metrics", source, f"{item['name']} hold-out {label}: {formatted}.")
             if matrix_requested:
                 if metrics.get("confusion_matrix"):
@@ -230,6 +243,11 @@ def resolve_question(question, evidence, previous_question=""):
                     message = f"The hold-out majority-class baseline is {value:.2%}."
                     if metrics.get("accuracy") is not None:
                         message += f" The model accuracy difference is {(metrics['accuracy'] - value) * 100:+.2f} percentage points."
+                    verdict = evidence.get("guardrails", {}).get("baseline_comparison") or {}
+                    if item.get("is_best") and verdict.get("outcome"):
+                        message += " Guardrails verdict: " + verdict["outcome"].replace("_", " ") + ". [guardrails]"
+                    elif re.search(r"substantial|limited|meaningful", q):
+                        message += " A recorded Guardrails verdict is unavailable."
                     add("metrics", source, message)
     dataset_baseline = baseline_requested and re.search(r"dataset|overall class", q)
     if dataset_baseline and counts and rows:
@@ -282,7 +300,7 @@ def resolve_question(question, evidence, previous_question=""):
                 ". These describe model behavior and statistical associations.")
         else:
             missing("shap", "models/shap", "The requested feature explanation")
-    if re.search(r"\bduration\b|feature availability|target leakage|before the call", q) and model.get("availability"):
+    if (timing or re.search(r"\bduration\b|target leakage", q)) and model.get("availability"):
         for col, entry in model["availability"].items():
             add("availability", "models/availability", f"`{col}`: {entry['reason']}")
         comparison = model.get("availability_comparison")
