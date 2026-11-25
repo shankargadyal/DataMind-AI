@@ -27,7 +27,7 @@ from sklearn.ensemble import (
 from sklearn.linear_model import LogisticRegression, Ridge
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.metrics import (
-    roc_auc_score, accuracy_score, precision_score, recall_score, f1_score,
+    average_precision_score, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score,
     r2_score, mean_absolute_error, mean_squared_error, confusion_matrix,
 )
 import warnings
@@ -292,6 +292,7 @@ def _eval_metrics(model, X_train, X_test, y_train, y_test, task_type, labels, po
         metrics = classification_metrics(y_test, predicted, labels, positive_index, int(np.bincount(y_train).argmax()))
         if positive_index is not None and hasattr(model, "predict_proba") and len(np.unique(y_test)) == 2:
             probability = model.predict_proba(X_test)[:, list(model.classes_).index(positive_index)]
+            metrics["average_precision"] = float(average_precision_score(np.asarray(y_test) == positive_index, probability))
             metrics["roc_auc"] = float(roc_auc_score(np.asarray(y_test) == positive_index, probability))
         metrics.update(cv_score=acc, cv_std=std, cv_f1_macro=macro, cv_folds=folds, cv_note=note,
                        n_test=len(y_test), f1_macro=metrics["macro_f1"],

@@ -912,7 +912,7 @@ def answer_question(df: pd.DataFrame | None, message: str) -> dict:
     from agents.analysis_evidence import missing_financial_measure
     measure = missing_financial_measure(message, df.columns)
     if measure:
-        return _result("clarify", "clarification", f"Which field records {measure}? I could not identify a {measure} column to calculate that amount.")
+        return _result("clarify", "clarification", f"The requested amount is unavailable because the dataset has no identified {measure} column.")
     try:
         if _is_model_or_explanation_intent(df, message):
             return _result("unsupported", "unsupported", "")   # -> RAG / report context in the chat route

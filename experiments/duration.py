@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.base import clone
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
 
@@ -31,6 +31,7 @@ def run(path, output):
         pipe.fit(X.iloc[train], y.iloc[train])
         pred = pipe.predict(X.iloc[test])
         metrics = classification_metrics(y.iloc[test], pred, ["no", "yes"], 1, int(y.iloc[train].mode()[0]))
+        metrics["average_precision"] = float(average_precision_score(y.iloc[test], pipe.predict_proba(X.iloc[test])[:, 1]))
         metrics["roc_auc"] = float(roc_auc_score(y.iloc[test], pipe.predict_proba(X.iloc[test])[:, 1]))
         rows.append({"include_duration": include, "features": list(X), **metrics})
     params = {k: v for k, v in model.get_params().items() if v is not None}

@@ -339,3 +339,44 @@ def test_unseen_questions_through_chat_api(bank_analysis, monkeypatch):
             reply = client.post("/api/chat", json={"message": question, "job_id": job_id}).json["reply"]
             assert all(fragment in reply for fragment in expected), reply
             assert "remaining part" not in reply
+
+
+@pytest.mark.parametrize(("question", "expected", "excluded"), [
+    ("How many actual subscribers were incorrectly classified?", ["Actual yes, predicted no: 62"], ["4,000"]),
+    ("How many actual no cases were incorrectly predicted as yes?", ["Actual no, predicted yes: 35"], ["4,000"]),
+    ("How many hold-out customers were correctly classified?", ["766 + 42 = 808", "905"], ["4,521"]),
+    ("Why is high accuracy misleading?", ["89.3%", "88.5%", "40.4%", "Macro F1"], []),
+    ("Explain macro versus weighted F1.", ["equally", "support"], []),
+    ("Which columns are unavailable before the call?", ["duration", "after"], ["17 columns"]),
+    ("Is the improvement over baseline substantial?", ["slightly above"], []),
+    ("What is the average annual salary?", ["salary", "unavailable"], ["choose"]),
+    ("Can we guarantee the same performance on future customers?", ["later representative cohort"], ["4,521"]),
+    ("Does data quality guarantee model accuracy?", ["separate evaluation"], []),
+    ("Would changing duration cause subscriptions?", ["Confounding", "randomized"], []),
+])
+def test_evaluation_meaning(bank_analysis, question, expected, excluded):
+    _, _, evidence = bank_analysis
+    evidence["model"]["availability"] = {"duration": {"reason": "Only known after the call."}}
+    metrics = evidence["model"]["models"][0]["metrics"]
+    evidence["guardrails"] = {"baseline_comparison": evaluator.compare_baseline(metrics)}
+    reply, _ = analysis_evidence.resolve_question(question, evidence)
+    assert all(fragment in reply for fragment in expected), reply
+    assert all(fragment not in reply for fragment in excluded), reply
+
+
+def test_pdf_probability_metrics_and_selection_match_chat(bank_analysis):
+    from pypdf import PdfReader
+    from agents.report_generator import generate_pdf_report
+
+    det, ml, evidence = bank_analysis
+    metrics = ml["models"][0]["metrics"]
+    metrics.update(roc_auc=.81726, average_precision=.41821, cv_score=.8542, cv_f1_macro=.6161, cv_folds=3)
+    ml["evaluation_protocol"]["selection_rule"] = "Highest training cross-validation macro F1"
+    payload = generate_pdf_report({"ml_recommendation": ml}, det, ml)
+    content = " ".join(page.extract_text() for page in PdfReader(io.BytesIO(payload)).pages)
+    for metric, key in (("ROC-AUC", "roc_auc"), ("Average precision", "average_precision")):
+        value = format(metrics[key], ".4g")
+        assert metric in content and value in content
+        assert value in analysis_evidence.resolve_question(metric, evidence)[0]
+    assert "0.8542" in content and "0.6161" in content
+    assert ml["evaluation_protocol"]["selection_rule"] in content

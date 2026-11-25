@@ -77,7 +77,7 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
     }
 
     def tbl(data, col_widths, header_bg=C_PRIMARY):
-        t = Table(data, colWidths=col_widths)
+        t = Table(data, colWidths=col_widths, repeatRows=1)
         t.setStyle(TableStyle([
             ("BACKGROUND",    (0, 0), (-1, 0), header_bg),
             ("TEXTCOLOR",     (0, 0), (-1, 0), colors.white),
@@ -306,22 +306,36 @@ def generate_pdf_report(analysis_data: dict, ctx_safe: dict, ml_safe: dict, indu
         story.append(Spacer(1, 8))
 
         # Detailed metrics for best model
-        bm = ml.get("best_metrics", {})
+        protocol = ml.get("evaluation_protocol") or {}
+        if protocol.get("selection_rule"):
+            story.append(Paragraph("Selection criterion: " + escape(protocol["selection_rule"]), sty["body"]))
+        cv_label = {"classification": "CV accuracy", "regression": "CV R2"}.get(task, "CV score")
+        cv_rows = [["Candidate", cv_label, "CV macro F1", "Folds"]]
+        for candidate in models:
+            values = candidate.get("metrics") or {}
+            if values.get("cv_score") is not None:
+                macro = values.get("cv_f1_macro")
+                cv_rows.append([Paragraph(escape(candidate["name"]), sty["small"]), f"{values['cv_score']:.4g}",
+                                f"{macro:.4g}" if macro is not None else "n/a", str(values.get("cv_folds", "n/a"))])
+        if len(cv_rows) > 1:
+            story.append(tbl(cv_rows, [6*cm, 3*cm, 3.5*cm, 2*cm]))
+        bm = next((candidate.get("metrics") for candidate in models if candidate.get("is_best")), None) or ml.get("best_metrics", {})
         if bm:
             story.append(Paragraph(f"Best Model Metrics — {ml.get('best_model','')}", sty["h1"]))
             if task == "classification":
-                _macro = bm.get("f1_macro")
-                met_data = [
-                    ["Accuracy", "F1 (weighted)", "F1 (macro)", "Precision (weighted)", "Recall (weighted)"],
-                    [
-                        f"{round(bm.get('accuracy',0)*100,1)}%",
-                        f"{round(bm.get('f1',0)*100,1)}%",
-                        f"{round(_macro*100,1)}%" if _macro is not None else "n/a",
-                        f"{round(bm.get('precision',0)*100,1)}%",
-                        f"{round(bm.get('recall',0)*100,1)}%",
-                    ]
-                ]
-                story.append(tbl(met_data, [2.9*cm]*5, header_bg=C_SUCCESS))
+                metric_rows = [["Hold-out metric", "Value"]]
+                for label, key, fallback in (
+                    ("Accuracy", "accuracy", None), ("Weighted F1", "weighted_f1", "f1"),
+                    ("Macro F1", "macro_f1", "f1_macro"), ("Weighted precision", "precision", None),
+                    ("Weighted recall", "recall", None), ("ROC-AUC", "roc_auc", None),
+                    ("Average precision", "average_precision", None),
+                ):
+                    value = bm.get(key, bm.get(fallback))
+                    formatted = "Unavailable" if value is None else (
+                        f"{value:.4g}" if key in ("roc_auc", "average_precision") else f"{value:.1%}"
+                    )
+                    metric_rows.append([label, formatted])
+                story.append(tbl(metric_rows, [8*cm, 5*cm], header_bg=C_SUCCESS))
                 story.append(Paragraph(
                     "Weighted metrics average over classes in proportion to their size, so large classes dominate. "
                     "Macro F1 counts every class equally and reveals poor results on small classes.", sty["small"]))

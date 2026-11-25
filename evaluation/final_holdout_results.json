@@ -1,0 +1,99 @@
+[
+  {
+    "question": "How many actual yes cases were labeled no?",
+    "requires": [
+      "63",
+      "predicted no"
+    ],
+    "reply": "**Computed from analysis evidence**\n\nFor `y`, `no`: 4,000, `yes`: 521. [target/distribution]",
+    "passed": false
+  },
+  {
+    "question": "On the hold-out, count the correctly classified cases.",
+    "requires": [
+      "806",
+      "905"
+    ],
+    "reply": "**Computed from analysis evidence**\n\nThe diagonal sums to 765 + 41 = 806 correct predictions out of 905 hold-out cases. [models/XGBoost]",
+    "passed": true
+  },
+  {
+    "question": "Could high accuracy mask weak detection of subscribers?",
+    "requires": [
+      "39.4%",
+      "88.5%",
+      "Macro F1"
+    ],
+    "reply": "**Computed from analysis evidence**\n\nAccuracy weights each case equally, so the majority class can dominate it. Hold-out accuracy: 89.1%. Majority baseline: 88.5%. Positive-class recall: 39.4%. Macro F1: 69.6%. Recall measures the fraction of actual positives detected. Macro F1 gives each class equal weight. [models/XGBoost]",
+    "passed": true
+  },
+  {
+    "question": "Contrast weighted and macro F1 for the winning classifier.",
+    "requires": [
+      "support",
+      "equally"
+    ],
+    "reply": "**Computed from analysis evidence**\n\nMacro F1 weights classes equally. Weighted F1 weights each class by its hold-out support, so frequent classes contribute more. [metric definition]\n\nXGBoost hold-out macro F1: 69.6%. [models/XGBoost]\n\nXGBoost hold-out weighted F1: 88.3%. [models/XGBoost]",
+    "passed": true
+  },
+  {
+    "question": "Which inputs would a caller lack before the call starts?",
+    "requires": [
+      "duration"
+    ],
+    "excludes": [
+      "records"
+    ],
+    "reply": "**Computed from analysis evidence**\n\n`duration`: Call duration is available after the call. Exclude it when scoring prospects before a call. [models/availability]",
+    "passed": true
+  },
+  {
+    "question": "How meaningful was the baseline gain according to Guardrails?",
+    "requires": [
+      "unavailable"
+    ],
+    "excludes": [
+      "substantially above"
+    ],
+    "reply": "**Computed from analysis evidence**\n\nThe hold-out majority-class baseline is 88.51%. The model accuracy difference is +0.55 percentage points. A recorded Guardrails verdict is unavailable. [models/XGBoost]",
+    "passed": true
+  },
+  {
+    "question": "What annual wages are recorded for customers?",
+    "requires": [
+      "wages",
+      "unavailable"
+    ],
+    "reply": "**Computed from analysis evidence**\n\nThe uploaded schema contains no identified wages field. The requested quantity is unavailable. [dataset]",
+    "passed": true
+  },
+  {
+    "question": "Should we expect the same hit rate on next campaign customers?",
+    "requires": [
+      "future performance"
+    ],
+    "excludes": [
+      "4,521"
+    ],
+    "reply": "**Computed from analysis evidence**\n\nHold-out evaluation estimates performance on the sampled population. Changes in customers, collection or behavior can change future performance. Validate on a later representative cohort. [evaluation guidance]",
+    "passed": true
+  },
+  {
+    "question": "Does a clean dataset by itself ensure reliable predictions?",
+    "requires": [
+      "representative",
+      "evaluation"
+    ],
+    "reply": "The available evidence does not support a verified answer to that question. Try asking how many rows are in the dataset or which target was selected. AI interpretation is unavailable without a configured language model.",
+    "passed": false
+  },
+  {
+    "question": "Could changing the length of a call cause a subscription?",
+    "requires": [
+      "Confounding",
+      "causal evidence"
+    ],
+    "reply": "**Computed from analysis evidence**\n\nPredictive associations and SHAP attributions describe model behavior. Confounding and selection can produce associations. Establishing a causal effect requires separate causal evidence, such as a randomized intervention. [interpretation guidance]",
+    "passed": true
+  }
+]
